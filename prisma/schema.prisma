@@ -1,0 +1,475 @@
+// =============================================================================
+// IncaCook — v1 Prisma schema (thin first slice)
+//
+// Conventions
+// - Primary keys are ULIDs generated at the application layer (`ulid()`).
+//   Stored as String (Postgres `text`).
+// - Money is stored as integer cents (EUR only in v1).
+// - Commission rate is stored in basis points (3000 = 30.00%).
+// - Soft delete via `deletedAt DateTime?` on user-editable entities. Financial
+//   rows (Order, OrderItem, Delivery, AuditLog, IdempotencyKey) are
+//   hard-delete-forbidden by policy.
+// - Geo columns use PostGIS `geography(Point, 4326)`. Prisma cannot type or
+//   query these natively; reads/writes go through raw SQL or a Prisma
+//   extension. GIST indexes must be added via a hand-edited migration step.
+// - Postgres enums are mirrored from src/common/enums/*.ts. Adding a value
+//   requires a migration — by design, so code can't produce a state the DB
+//   doesn't accept.
+// =============================================================================
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  directUrl  = env("DIRECT_URL")
+  extensions = [postgis]
+}
+
+// -------- Enums --------
+
+enum UserRole {
+  BUYER
+  SELLER
+  DRIVER
+  ADMIN
+  MODERATOR
+}
+
+enum SellerCategory {
+  FAIT_MAISON
+  TRAITEUR
+  RESTAURANT
+}
+
+enum Dietary {
+  HALAL
+  VEGAN
+  GLUTEN_FREE
+  CASHER
+}
+
+enum Allergen {
+  // EU-mandated 14-item allergen list. French names.
+  GLUTEN
+  CRUSTACES
+  OEUFS
+  POISSONS
+  ARACHIDES
+  SOJA
+  LAIT
+  FRUITS_A_COQUE
+  CELERI
+  MOUTARDE
+  SESAME
+  SULFITES
+  LUPIN
+  MOLLUSQUES
+}
+
+enum SavedAddressType {
+  HOME
+  WORK
+  OTHER
+}
+
+enum KycStatus {
+  PENDING
+  SUBMITTED
+  APPROVED
+  REJECTED
+}
+
+enum CourseType {
+  STARTER
+  MAIN_COURSE
+  DESSERT
+  SNACK
+  BEVERAGE
+  SIDE_DISH
+  FULL_MEAL
+  BAKERY
+}
+
+enum ListingStatus {
+  DRAFT
+  PUBLISHED
+  PAUSED
+  EXPIRED
+  SOLD_OUT
+  ARCHIVED
+}
+
+enum OrderStatus {
+  PENDING
+  CONFIRMED
+  PREPARING
+  READY
+  PICKED_UP
+  IN_DELIVERY
+  DELIVERED
+  COMPLETED
+  CANCELLED
+  REFUNDED
+  DISPUTED
+}
+
+enum DeliveryStatus {
+  UNASSIGNED
+  SEARCHING
+  ASSIGNED
+  EN_ROUTE_TO_PICKUP
+  AT_PICKUP
+  PICKED_UP
+  EN_ROUTE_TO_DROPOFF
+  AT_DROPOFF
+  DELIVERED
+  CANCELLED
+  FAILED
+}
+
+// -------- Identity --------
+
+model User {
+  id         String   @id
+  // Foreign key to Supabase Auth `auth.users.id`. The Supabase JWT carries
+  // this in the `sub` claim. Source of truth for credentials lives in
+  // Supabase; this row holds IncaCook-domain profile fields.
+  supabaseId String   @unique
+  email      String   @unique
+  phone      String?  @unique
+  role       UserRole @default(BUYER)
+
+  firstName  String
+  lastName   String
+  avatarPath String?
+
+  // Mirrored from Supabase auth so we can filter without touching the auth
+  // schema. Kept in sync via the auth webhook / on-login refresh.
+  emailVerified Boolean @default(false)
+  phoneVerified Boolean @default(false)
+
+  // Legal terms acceptance captured at signup. acceptedAt is set when both
+  // CGU and CGV are accepted; required to satisfy GDPR/consumer-law records.
+  acceptedCgu Boolean   @default(false)
+  acceptedCgv Boolean   @default(false)
+  acceptedAt  DateTime?
+
+  // GDPR: erasure is performed by anonymising this row, not deleting.
+  deletedAt DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  sellerProfile SellerProfile?
+  driverProfile DriverProfile?
+  buyerProfile  BuyerProfile?
+  addresses     Address[]
+
+  buyerOrders     Order[]          @relation("BuyerOrders")
+  auditLogs       AuditLog[]
+  idempotencyKeys IdempotencyKey[]
+
+  @@index([role])
+  @@index([deletedAt])
+}
+
+model SellerProfile {
+  id     String @id
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id])
+
+  category     SellerCategory
+  displayName  String
+  slug         String         @unique
+  bio          String?
+  kitchenNotes String?
+
+  pickupAddress String
+  // PostGIS geography(Point, 4326). Manage via raw SQL.
+  pickupPoint   Unsupported("geography(Point, 4326)")?
+
+  kycStatus       KycStatus @default(PENDING)
+  stripeAccountId String?   @unique
+
+  isPremium     Boolean @default(false) // 25% commission tier vs 30%
+  totalOrders   Int     @default(0)
+  averageRating Float?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  listings Listing[]
+  orders   Order[]   @relation("SellerOrders")
+
+  @@index([category])
+  @@index([kycStatus])
+}
+
+model DriverProfile {
+  id     String @id
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id])
+
+  vehicleType   String
+  licenseNumber String?
+
+  kycStatus       KycStatus @default(PENDING)
+  stripeAccountId String?   @unique
+
+  // Real-time location is broadcast through Redis; this column is a periodic
+  // flush of the last known position for offline reads and history.
+  lastKnownPoint Unsupported("geography(Point, 4326)")?
+  lastSeenAt     DateTime?
+  isOnline       Boolean                                @default(false)
+
+  averageRating   Float?
+  totalDeliveries Int    @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  deliveries Delivery[]
+
+  @@index([isOnline])
+  @@index([kycStatus])
+}
+
+model BuyerProfile {
+  userId String @id
+  user   User   @relation(fields: [userId], references: [id])
+
+  defaultAddressId String?
+  defaultAddress   Address? @relation("BuyerDefaultAddress", fields: [defaultAddressId], references: [id])
+
+  // Postgres enum arrays. Default to empty rather than NULL so reads never
+  // need a null-check.
+  dietaryPreferences Dietary[]  @default([])
+  allergies          Allergen[] @default([])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Address {
+  id     String @id
+  userId String
+  user   User   @relation(fields: [userId], references: [id])
+
+  type        SavedAddressType?
+  customLabel String?
+
+  fullAddress String
+  city        String
+  postalCode  String
+
+  // PostGIS geography(Point, 4326). Written via raw SQL (`ST_MakePoint`).
+  // GIST index added in the migration for radius queries.
+  point Unsupported("geography(Point, 4326)")?
+
+  apartment     String?
+  floor         String?
+  digicode      String?
+  deliveryNotes String?
+
+  deletedAt DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  buyersWithDefault BuyerProfile[] @relation("BuyerDefaultAddress")
+
+  @@index([userId])
+  @@index([deletedAt])
+}
+
+// -------- Catalog --------
+
+model Listing {
+  id       String        @id
+  sellerId String
+  seller   SellerProfile @relation(fields: [sellerId], references: [id])
+
+  title       String
+  description String?
+  imagePaths  String[] // Supabase Storage paths
+
+  // Money in cents.
+  priceCents        Int
+  quantityAvailable Int @default(1)
+
+  // Cuisines stay as text[] — taxonomy will grow (per BACKEND_SCHEMA.md).
+  // Dietary tags and allergens are constrained Postgres enum arrays.
+  cuisines   String[]
+  dietary    Dietary[]  @default([])
+  allergens  Allergen[] @default([])
+  courseType CourseType
+
+  status ListingStatus @default(DRAFT)
+
+  // When the listing should be hidden from the feed.
+  expiresAt         DateTime
+  // When the food is/will be ready for pickup.
+  preparedAt        DateTime?
+  pickupWindowStart DateTime?
+  pickupWindowEnd   DateTime?
+
+  deletedAt DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  orderItems OrderItem[]
+
+  @@index([sellerId, status, expiresAt])
+  @@index([status, expiresAt])
+  @@index([deletedAt])
+}
+
+// -------- Commerce --------
+
+model Order {
+  id        String @id
+  // Human-friendly short code (e.g. "X3K7M9") for support and notifications.
+  shortCode String @unique
+
+  buyerId String
+  buyer   User   @relation("BuyerOrders", fields: [buyerId], references: [id])
+
+  sellerId String
+  seller   SellerProfile @relation("SellerOrders", fields: [sellerId], references: [id])
+
+  status OrderStatus @default(PENDING)
+
+  // Pricing snapshot — frozen at creation. Listing/commission changes after
+  // this point do not affect the order.
+  subtotalCents       Int
+  deliveryFeeCents    Int
+  commissionRateBps   Int // basis points: 3000 = 30.00%
+  commissionCents     Int
+  sellerEarningsCents Int // subtotalCents - commissionCents
+  buyerTotalCents     Int // subtotalCents + deliveryFeeCents
+
+  // Drop-off
+  dropoffAddress       String
+  dropoffPoint         Unsupported("geography(Point, 4326)")
+  deliveryInstructions String?
+
+  // Lifecycle timestamps. status is the source of truth; these mirror it for
+  // analytics and SLA reporting.
+  placedAt           DateTime  @default(now())
+  confirmedAt        DateTime?
+  readyAt            DateTime?
+  completedAt        DateTime?
+  cancelledAt        DateTime?
+  cancellationReason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  items      OrderItem[]
+  deliveries Delivery[]
+
+  @@index([buyerId, createdAt(sort: Desc)])
+  @@index([sellerId, createdAt(sort: Desc)])
+  @@index([status, createdAt])
+}
+
+model OrderItem {
+  id      String @id
+  orderId String
+  order   Order  @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  listingId String
+  listing   Listing @relation(fields: [listingId], references: [id])
+
+  // Listing snapshot — keeps order history readable even if the listing is
+  // edited or deleted later.
+  listingTitle   String
+  listingImage   String?
+  unitPriceCents Int
+  quantity       Int
+  subtotalCents  Int
+
+  createdAt DateTime @default(now())
+
+  @@index([orderId])
+  @@index([listingId])
+}
+
+// -------- Fulfillment --------
+
+model Delivery {
+  id      String @id
+  orderId String
+  order   Order  @relation(fields: [orderId], references: [id])
+
+  // Null while in SEARCHING/UNASSIGNED. A failed delivery may be reassigned
+  // by inserting a new Delivery row pointing at the same Order.
+  driverId String?
+  driver   DriverProfile? @relation(fields: [driverId], references: [id])
+
+  status DeliveryStatus @default(UNASSIGNED)
+
+  pickupEta  DateTime?
+  dropoffEta DateTime?
+
+  driverAssignedAt DateTime?
+  pickedUpAt       DateTime?
+  deliveredAt      DateTime?
+  failedAt         DateTime?
+  failureReason    String?
+
+  proofOfDeliveryPath String? // Supabase Storage path
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([orderId])
+  @@index([driverId, status])
+  @@index([status])
+}
+
+// -------- Platform plumbing --------
+
+model AuditLog {
+  id      String  @id
+  // Null for system-initiated actions (cron jobs, webhooks, etc.).
+  actorId String?
+  actor   User?   @relation(fields: [actorId], references: [id])
+
+  action     String // e.g. "order.create", "listing.publish"
+  targetType String? // e.g. "Order", "Listing"
+  targetId   String?
+
+  metadata      Json?
+  correlationId String?
+  ipAddress     String?
+
+  createdAt DateTime @default(now())
+
+  @@index([actorId, createdAt(sort: Desc)])
+  @@index([targetType, targetId])
+  @@index([action, createdAt(sort: Desc)])
+}
+
+model IdempotencyKey {
+  // Composite uniqueness on (userId, key) — same Idempotency-Key from
+  // different users is fine.
+  id     String @id
+  userId String
+  user   User   @relation(fields: [userId], references: [id])
+
+  key            String
+  // Hash of method + path + body — lets us detect "same key, different
+  // request" and reject as 409.
+  requestHash    String
+  responseStatus Int
+  responseBody   Json
+
+  createdAt DateTime @default(now())
+  expiresAt DateTime
+
+  @@unique([userId, key])
+  @@index([expiresAt]) // cleanup sweep
+}

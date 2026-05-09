@@ -1,0 +1,17 @@
+export enum CuisineType {
+  French = 'FRENCH',
+  Italian = 'ITALIAN',
+  Asian = 'ASIAN',
+  Indian = 'INDIAN',
+  Mediterranean = 'MEDITERRANEAN',
+  Mexican = 'MEXICAN',
+  African = 'AFRICAN',
+  MiddleEastern = 'MIDDLE_EASTERN',
+  Japanese = 'JAPANESE',
+  Chinese = 'CHINESE',
+  Thai = 'THAI',
+  Vietnamese = 'VIETNAMESE',
+  American = 'AMERICAN',
+  Caribbean = 'CARIBBEAN',
+  Other = 'OTHER',
+}

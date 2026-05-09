@@ -1,0 +1,6 @@
+{
+  "_comment": "Kept for compatibility with the NestJS CLI 'pnpm test:e2e' default convention. Active config lives in vitest-e2e.config.ts.",
+  "moduleFileExtensions": ["js", "json", "ts"],
+  "rootDir": ".",
+  "testRegex": ".e2e-spec.ts$"
+}
