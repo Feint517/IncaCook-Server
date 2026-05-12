@@ -1,17 +1,14 @@
+/**
+ * 7-value FR enum per BACKEND_SCHEMA.md. Doc flags this as a "lookup table
+ * (will grow)" — when a new cuisine is needed, add it here and migrate the
+ * Postgres enum.
+ */
 export enum CuisineType {
-  French = 'FRENCH',
-  Italian = 'ITALIAN',
-  Asian = 'ASIAN',
-  Indian = 'INDIAN',
-  Mediterranean = 'MEDITERRANEAN',
-  Mexican = 'MEXICAN',
-  African = 'AFRICAN',
-  MiddleEastern = 'MIDDLE_EASTERN',
-  Japanese = 'JAPANESE',
-  Chinese = 'CHINESE',
-  Thai = 'THAI',
-  Vietnamese = 'VIETNAMESE',
-  American = 'AMERICAN',
-  Caribbean = 'CARIBBEAN',
-  Other = 'OTHER',
+  Orientale = 'ORIENTALE',
+  Francaise = 'FRANCAISE',
+  Africaine = 'AFRICAINE',
+  Portugaise = 'PORTUGAISE',
+  Italienne = 'ITALIENNE',
+  Espagnole = 'ESPAGNOLE',
+  Latine = 'LATINE',
 }

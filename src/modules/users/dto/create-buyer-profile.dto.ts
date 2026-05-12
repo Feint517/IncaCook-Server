@@ -2,7 +2,7 @@ import { Type } from 'class-transformer';
 import { IsArray, IsEnum, IsOptional, ValidateNested } from 'class-validator';
 
 import { Allergen } from '@common/enums/allergen.enum';
-import { Dietary } from '@common/enums/dietary.enum';
+import { DietaryTag } from '@common/enums/dietary-tag.enum';
 
 import { CreateAddressDto } from './create-address.dto';
 
@@ -14,8 +14,8 @@ import { CreateAddressDto } from './create-address.dto';
 export class CreateBuyerProfileDto {
   @IsOptional()
   @IsArray()
-  @IsEnum(Dietary, { each: true })
-  dietaryPreferences?: Dietary[];
+  @IsEnum(DietaryTag, { each: true })
+  dietaryPreferences?: DietaryTag[];
 
   @IsOptional()
   @IsArray()

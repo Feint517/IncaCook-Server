@@ -37,6 +37,11 @@ export const envSchema = z.object({
   STRIPE_PUBLISHABLE_KEY: z.string().min(1),
   STRIPE_WEBHOOK_SECRET: z.string().min(1),
   STRIPE_CONNECT_CLIENT_ID: z.string().min(1),
+  // Connect onboarding return targets (Account Links). Optional at boot
+  // so devs not yet wiring Stripe can still start the server; the
+  // onboarding service rejects requests if either is empty.
+  STRIPE_ONBOARDING_RETURN_URL: z.union([z.literal(''), z.string().url()]).default(''),
+  STRIPE_ONBOARDING_REFRESH_URL: z.union([z.literal(''), z.string().url()]).default(''),
 
   // Twilio
   TWILIO_ACCOUNT_SID: z.string().optional().default(''),

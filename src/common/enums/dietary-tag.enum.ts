@@ -1,4 +1,4 @@
-export enum Dietary {
+export enum DietaryTag {
   Halal = 'HALAL',
   Vegan = 'VEGAN',
   GlutenFree = 'GLUTEN_FREE',

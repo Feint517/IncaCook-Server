@@ -6,6 +6,9 @@ import type { AuthenticatedUser } from '@common/types/authenticated-request.type
 import { AddressResponseDto } from './dto/address-response.dto';
 import { BuyerProfileResponseDto } from './dto/buyer-profile-response.dto';
 import { CreateUserDto } from './dto/create-user.dto';
+import { DriverProfileResponseDto } from './dto/driver-profile-response.dto';
+import { OpeningHoursResponseDto } from './dto/opening-hours-response.dto';
+import { SellerProfileResponseDto } from './dto/seller-profile-response.dto';
 import { UserResponseDto } from './dto/user-response.dto';
 import { UsersService, type UserAggregate } from './users.service';
 
@@ -39,14 +42,32 @@ export class UsersController {
 }
 
 function toUserResponse(aggregate: UserAggregate): UserResponseDto {
-  if (!aggregate.buyerProfile) {
-    return UserResponseDto.from(aggregate.user);
-  }
+  const buyerProfile = aggregate.buyerProfile
+    ? BuyerProfileResponseDto.from(
+        aggregate.buyerProfile,
+        aggregate.buyerProfile.defaultAddress
+          ? AddressResponseDto.from(
+              aggregate.buyerProfile.defaultAddress,
+              aggregate.defaultAddressCoords,
+            )
+          : null,
+      )
+    : undefined;
 
-  const defaultAddress = aggregate.buyerProfile.defaultAddress
-    ? AddressResponseDto.from(aggregate.buyerProfile.defaultAddress, aggregate.defaultAddressCoords)
-    : null;
+  const sellerProfile = aggregate.sellerProfile
+    ? SellerProfileResponseDto.from(
+        aggregate.sellerProfile,
+        AddressResponseDto.from(aggregate.sellerProfile.pickupAddress, aggregate.pickupAddressCoords),
+        aggregate.sellerProfile.openingHours.map((hr) => OpeningHoursResponseDto.from(hr)),
+      )
+    : undefined;
 
-  const buyerProfile = BuyerProfileResponseDto.from(aggregate.buyerProfile, defaultAddress);
-  return UserResponseDto.from(aggregate.user, buyerProfile);
+  const driverProfile = aggregate.driverProfile
+    ? DriverProfileResponseDto.from(
+        aggregate.driverProfile,
+        AddressResponseDto.from(aggregate.driverProfile.baseAddress, aggregate.baseAddressCoords),
+      )
+    : undefined;
+
+  return UserResponseDto.from(aggregate.user, { buyerProfile, sellerProfile, driverProfile });
 }

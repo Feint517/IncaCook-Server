@@ -45,7 +45,7 @@ enum SellerCategory {
   RESTAURANT
 }
 
-enum Dietary {
+enum DietaryTag {
   HALAL
   VEGAN
   GLUTEN_FREE
@@ -77,30 +77,80 @@ enum SavedAddressType {
 }
 
 enum KycStatus {
+  // PENDING is the post-signup default for traiteur/restaurant sellers and
+  // for drivers. fait_maison sellers are auto-promoted to APPROVED via an
+  // INSERT trigger on SellerProfile (no admin review required).
   PENDING
-  SUBMITTED
   APPROVED
   REJECTED
 }
 
-enum CourseType {
-  STARTER
-  MAIN_COURSE
-  DESSERT
-  SNACK
-  BEVERAGE
-  SIDE_DISH
-  FULL_MEAL
-  BAKERY
+enum CuisineType {
+  // Doc lists this as a "lookup table (will grow)" candidate; we start with
+  // a Postgres enum and migrate values in as they're added.
+  ORIENTALE
+  FRANCAISE
+  AFRICAINE
+  PORTUGAISE
+  ITALIENNE
+  ESPAGNOLE
+  LATINE
 }
 
-enum ListingStatus {
-  DRAFT
-  PUBLISHED
-  PAUSED
-  EXPIRED
-  SOLD_OUT
-  ARCHIVED
+enum DishType {
+  ENTREE
+  PLAT
+  DESSERT
+  COCKTAIL_DINATOIRE
+}
+
+enum DayOfWeek {
+  MONDAY
+  TUESDAY
+  WEDNESDAY
+  THURSDAY
+  FRIDAY
+  SATURDAY
+  SUNDAY
+}
+
+enum IdDocumentType {
+  CARTE_IDENTITE
+  PASSEPORT
+  TITRE_SEJOUR
+}
+
+enum Fulfillment {
+  DELIVERY
+  PICKUP
+  BOTH
+}
+
+enum DriverVehicleType {
+  BICYCLE
+  SCOOTER
+  CAR
+}
+
+enum RatingCriterion {
+  HYGIENE
+  FOOD_QUALITY
+  PACKAGING
+}
+
+enum FulfillmentChoice {
+  DELIVERY
+  PICKUP
+}
+
+enum DeliveryTiming {
+  ASAP
+  SCHEDULED
+}
+
+enum IssueSeverity {
+  ABORT // driver cannot continue — order needs admin intervention
+  REPORT // mid-job concern; delivery proceeds
 }
 
 enum OrderStatus {
@@ -158,6 +208,9 @@ model User {
   acceptedCgv Boolean   @default(false)
   acceptedAt  DateTime?
 
+  // Populated as a side effect of the buyer's first payment — not at signup.
+  stripeCustomerId String? @unique
+
   // GDPR: erasure is performed by anonymising this row, not deleting.
   deletedAt DateTime?
   createdAt DateTime  @default(now())
@@ -172,52 +225,139 @@ model User {
   auditLogs       AuditLog[]
   idempotencyKeys IdempotencyKey[]
 
+  kycSubmissions     KycSubmission[] @relation("KycAuthor")
+  kycReviewsAuthored KycSubmission[] @relation("KycReviewer")
+
+  reviewsAuthored Review[]   @relation("ReviewAuthor")
+  bookmarks       Bookmark[]
+
   @@index([role])
   @@index([deletedAt])
 }
 
 model SellerProfile {
-  id     String @id
-  userId String @unique
+  // userId is BOTH the PK and the FK to User.id. Matches BuyerProfile and
+  // BACKEND_SCHEMA.md (`seller_profiles.user_id` PK).
+  userId String @id
   user   User   @relation(fields: [userId], references: [id])
 
-  category     SellerCategory
-  displayName  String
-  slug         String         @unique
-  bio          String?
-  kitchenNotes String?
+  category    SellerCategory
+  displayName String
+  bio         String?
 
-  pickupAddress String
-  // PostGIS geography(Point, 4326). Manage via raw SQL.
-  pickupPoint   Unsupported("geography(Point, 4326)")?
+  // Storage object key in `avatars/`. Doc convention: column name uses _url
+  // suffix even though the value is the bucket path. Resolved to a signed
+  // URL at read time.
+  profilePhotoUrl String
 
-  kycStatus       KycStatus @default(PENDING)
-  stripeAccountId String?   @unique
+  dateOfBirth DateTime @db.Date
+
+  // Pickup address — required for sellers. The Address row holds the geo
+  // point; SellerProfile.location below is a denormalized copy for
+  // ST_DWithin queries on the listing feed.
+  pickupAddressId String  @unique
+  pickupAddress   Address @relation("SellerPickupAddress", fields: [pickupAddressId], references: [id])
+
+  // Required iff category != FAIT_MAISON. Service-layer enforced.
+  businessName String?
+  // 14-digit, Luhn-validated. Required iff category != FAIT_MAISON.
+  siret        String?
+
+  // Required iff category = RESTAURANT. Storage key in `seller-facades/`.
+  restaurantFacadeUrl String?
+
+  cuisineTypes CuisineType[] @default([])
+  dishTypes    DishType[]    @default([])
+
+  hygieneCommitment    Boolean @default(false)
+  faitMaisonCommitment Boolean @default(false)
+
+  // Service area + economics.
+  deliveryRadiusKm Decimal @db.Decimal(4, 1)
+  deliveryFeeCents Int
+
+  // Prep window (minutes). prepMaxMinutes >= prepMinMinutes (service-layer).
+  prepMinMinutes Int
+  prepMaxMinutes Int
+
+  neighborhood  String
+  languageCodes String[] @default([]) // ISO codes
+
+  // Free-text human-readable schedule. Structured opening hours live in
+  // SellerOpeningHours (restaurants only).
+  availabilitySchedule String?
+
+  // Internal badge keys ("verified", "top-seller", etc.).
+  verifications String[] @default([])
+
+  promoText   String?
+  categoryTag String?
+
+  // Denormalized from pickupAddress.point for radius queries on the listing
+  // feed. Written via raw SQL inside the same transaction as Address insert.
+  // GIST-indexed in the migration.
+  location Unsupported("geography(Point, 4326)")?
+
+  // INSERT trigger sets this to APPROVED for FAIT_MAISON (no admin review).
+  // Application code also computes the right value on insert; the trigger
+  // is a safety net.
+  kycStatus KycStatus @default(PENDING)
+
+  // Stripe Express Connect account for receiving payouts. Created via
+  // Stripe Connect onboarding (separate slice). Onboarding completion is
+  // flipped by the `account.updated` webhook when charges_enabled,
+  // payouts_enabled, and details_submitted are all true.
+  stripeConnectAccountId    String? @unique
+  stripeOnboardingCompleted Boolean @default(false)
 
   isPremium     Boolean @default(false) // 25% commission tier vs 30%
   totalOrders   Int     @default(0)
+  // Denormalized aggregates over Review rows. Recomputed inside the same
+  // transaction that inserts a new review, so the buyer feed can sort by
+  // rating without joining the reviews table on every query.
   averageRating Float?
+  reviewCount   Int     @default(0)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  listings Listing[]
-  orders   Order[]   @relation("SellerOrders")
+  listings     Listing[]
+  orders       Order[]              @relation("SellerOrders")
+  openingHours SellerOpeningHours[]
+  reviews      Review[]             @relation("SellerReviews")
 
   @@index([category])
   @@index([kycStatus])
 }
 
 model DriverProfile {
-  id     String @id
-  userId String @unique
+  // userId is BOTH the PK and the FK to User.id. Matches BACKEND_SCHEMA.md
+  // (`driver_profiles.user_id` PK).
+  userId String @id
   user   User   @relation(fields: [userId], references: [id])
 
-  vehicleType   String
-  licenseNumber String?
+  dateOfBirth DateTime @db.Date
 
-  kycStatus       KycStatus @default(PENDING)
-  stripeAccountId String?   @unique
+  // Base address — where the driver typically operates from. Required.
+  baseAddressId String  @unique
+  baseAddress   Address @relation("DriverBaseAddress", fields: [baseAddressId], references: [id])
+
+  vehicleType DriverVehicleType
+
+  // Free-text neighborhood names. Doc flags this as a future FK to a
+  // `zones` lookup table; for now an array of strings.
+  operatingZones String[] @default([])
+
+  charterAccepted       Boolean @default(false)
+  punctualityCommitment Boolean @default(false)
+  careCommitment        Boolean @default(false)
+
+  kycStatus KycStatus @default(PENDING)
+
+  // Stripe Express Connect account for receiving payouts. Same lifecycle as
+  // SellerProfile — flipped to onboarded by the `account.updated` webhook.
+  stripeConnectAccountId    String? @unique
+  stripeOnboardingCompleted Boolean @default(false)
 
   // Real-time location is broadcast through Redis; this column is a periodic
   // flush of the last known position for offline reads and history.
@@ -231,7 +371,8 @@ model DriverProfile {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  deliveries Delivery[]
+  deliveries  Delivery[]
+  orderIssues OrderIssue[] @relation("DriverOrderIssues")
 
   @@index([isOnline])
   @@index([kycStatus])
@@ -246,8 +387,8 @@ model BuyerProfile {
 
   // Postgres enum arrays. Default to empty rather than NULL so reads never
   // need a null-check.
-  dietaryPreferences Dietary[]  @default([])
-  allergies          Allergen[] @default([])
+  dietaryPreferences DietaryTag[] @default([])
+  allergies          Allergen[]   @default([])
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -278,10 +419,65 @@ model Address {
   createdAt DateTime  @default(now())
   updatedAt DateTime  @updatedAt
 
-  buyersWithDefault BuyerProfile[] @relation("BuyerDefaultAddress")
+  buyersWithDefault  BuyerProfile[]  @relation("BuyerDefaultAddress")
+  sellersUsingPickup SellerProfile[] @relation("SellerPickupAddress")
+  driversUsingBase   DriverProfile[] @relation("DriverBaseAddress")
+  ordersWithDropoff  Order[]         @relation("OrderDropoff")
 
   @@index([userId])
   @@index([deletedAt])
+}
+
+model SellerOpeningHours {
+  // 1:N with SellerProfile, restaurants only (service-layer enforced).
+  sellerId String
+  seller   SellerProfile @relation(fields: [sellerId], references: [userId], onDelete: Cascade)
+
+  dayOfWeek DayOfWeek
+  // Local time, no zone — the seller's local opening time.
+  startTime DateTime  @db.Time()
+  endTime   DateTime  @db.Time()
+
+  @@id([sellerId, dayOfWeek])
+}
+
+model KycSubmission {
+  id     String @id
+  // The user submitting the documents. Resolved from the JWT — never
+  // accepted from the request body.
+  userId String
+  user   User   @relation("KycAuthor", fields: [userId], references: [id])
+
+  idDocumentType IdDocumentType
+
+  // All `*Url` columns hold Supabase Storage object keys in the `kyc/`
+  // bucket (e.g. `kyc/<supabase_user_id>/id-front.jpg`). Resolved to a
+  // signed URL at read time. The bucket is private; RLS restricts access
+  // to the owner + reviewers.
+  idFrontUrl String
+  idBackUrl  String?
+  selfieUrl  String
+
+  // Driver-specific fields (motorized vehicles only). Always null for
+  // sellers. Wired up when driver signup ships.
+  drivingLicenseUrl String?
+  carteGriseUrl     String?
+  insuranceUrl      String?
+
+  // Status starts at PENDING; admin review flips to APPROVED or REJECTED.
+  // The seller's SellerProfile.kycStatus mirrors the latest submission's
+  // status.
+  status KycStatus @default(PENDING)
+
+  reviewerId      String?
+  reviewer        User?     @relation("KycReviewer", fields: [reviewerId], references: [id])
+  reviewedAt      DateTime?
+  rejectionReason String?
+
+  submittedAt DateTime @default(now())
+
+  @@index([userId, submittedAt(sort: Desc)])
+  @@index([status])
 }
 
 // -------- Catalog --------
@@ -289,71 +485,164 @@ model Address {
 model Listing {
   id       String        @id
   sellerId String
-  seller   SellerProfile @relation(fields: [sellerId], references: [id])
+  seller   SellerProfile @relation(fields: [sellerId], references: [userId])
 
-  title       String
+  name        String
   description String?
-  imagePaths  String[] // Supabase Storage paths
+  // Up to 3 image URLs (storage object keys in `listings/`). DB CHECK
+  // constraint enforces the cap.
+  imageUrls   String[] @default([])
 
-  // Money in cents.
-  priceCents        Int
-  quantityAvailable Int @default(1)
+  // Money in cents (project-wide convention).
+  priceCents         Int
+  originalPriceCents Int? // pre-discount, when on promo
+  discountPercent    Int? // 0–100; could be derived but stored for query perf
 
-  // Cuisines stay as text[] — taxonomy will grow (per BACKEND_SCHEMA.md).
-  // Dietary tags and allergens are constrained Postgres enum arrays.
-  cuisines   String[]
-  dietary    Dietary[]  @default([])
-  allergens  Allergen[] @default([])
-  courseType CourseType
+  portionsLeft Int @default(1)
 
-  status ListingStatus @default(DRAFT)
+  // Per BACKEND_SCHEMA.md: each listing has at most one cuisine and one dish
+  // type. The kitchen's array of cuisines/dishes lives on SellerProfile.
+  cuisineType    CuisineType?
+  dishType       DishType?
+  dietaryTags    DietaryTag[] @default([])
+  allergens      Allergen[]   @default([])
+  // Free-text long-tail allergens (the 14-item enum doesn't cover everything).
+  otherAllergens String?
 
-  // When the listing should be hidden from the feed.
-  expiresAt         DateTime
-  // When the food is/will be ready for pickup.
-  preparedAt        DateTime?
-  pickupWindowStart DateTime?
-  pickupWindowEnd   DateTime?
+  isAvailable Boolean @default(true)
+  isVeg       Boolean @default(false)
+
+  // Free-text seller-defined sub-category like "Pizza mixte".
+  menuCategory String?
+
+  // Denormalized from SellerProfile.category at insert time. Avoids a join
+  // when filtering the buyer feed by seller category. Server-set, not from
+  // request body.
+  category SellerCategory
+
+  // delivery | pickup | both — how this dish can be fulfilled.
+  fulfillment Fulfillment
+
+  // Per-dish prep time in minutes. Distinct from SellerProfile's
+  // prepMin/Max which describe the kitchen's overall range.
+  prepMinutes Int
+
+  // Auto-hide from the buyer feed at this point.
+  expiresAt DateTime
 
   deletedAt DateTime?
   createdAt DateTime  @default(now())
   updatedAt DateTime  @updatedAt
 
   orderItems OrderItem[]
+  addOns     ListingAddOn[]
+  bookmarks  Bookmark[]
 
-  @@index([sellerId, status, expiresAt])
-  @@index([status, expiresAt])
+  @@index([sellerId, isAvailable, expiresAt])
+  @@index([isAvailable, expiresAt])
+  @@index([category, isAvailable, expiresAt])
   @@index([deletedAt])
+}
+
+model ListingAddOn {
+  id        String  @id
+  listingId String
+  listing   Listing @relation(fields: [listingId], references: [id], onDelete: Cascade)
+
+  label               String
+  // Can be negative (e.g. "no cheese: -0.50€").
+  priceDeltaCents     Int
+  isSelectedByDefault Boolean @default(false)
+  // Server-managed; sellers don't set this directly. Used to preserve order
+  // across PATCH replacements.
+  sortOrder           Int
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([listingId, sortOrder])
+}
+
+model Bookmark {
+  // Buyer's saved listing. Composite PK so duplicate POSTs are no-ops.
+  // Cascades on listing deletion (no point keeping a bookmark to a gone
+  // listing). User deletion stays restricted — User.deletedAt soft-deletes
+  // and we want to retain the bookmark history if the user is restored.
+  buyerId   String
+  buyer     User    @relation(fields: [buyerId], references: [id])
+  listingId String
+  listing   Listing @relation(fields: [listingId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@id([buyerId, listingId])
+  @@index([buyerId, createdAt(sort: Desc)])
+  // Used by SellerStats.mealsSaved (count via listing.sellerId).
+  @@index([listingId])
 }
 
 // -------- Commerce --------
 
 model Order {
-  id        String @id
+  id          String @id
   // Human-friendly short code (e.g. "X3K7M9") for support and notifications.
-  shortCode String @unique
+  orderNumber String @unique
 
   buyerId String
   buyer   User   @relation("BuyerOrders", fields: [buyerId], references: [id])
 
   sellerId String
-  seller   SellerProfile @relation("SellerOrders", fields: [sellerId], references: [id])
+  seller   SellerProfile @relation("SellerOrders", fields: [sellerId], references: [userId])
 
   status OrderStatus @default(PENDING)
 
   // Pricing snapshot — frozen at creation. Listing/commission changes after
   // this point do not affect the order.
   subtotalCents       Int
-  deliveryFeeCents    Int
+  fulfillmentFeeCents Int // 0 for pickup, seller's deliveryFeeCents for delivery
   commissionRateBps   Int // basis points: 3000 = 30.00%
   commissionCents     Int
   sellerEarningsCents Int // subtotalCents - commissionCents
-  buyerTotalCents     Int // subtotalCents + deliveryFeeCents
+  buyerTotalCents     Int // subtotalCents + fulfillmentFeeCents
 
-  // Drop-off
-  dropoffAddress       String
-  dropoffPoint         Unsupported("geography(Point, 4326)")
+  // Buyer's choice at checkout (subset of seller's offered Fulfillment).
+  fulfillmentChoice FulfillmentChoice
+
+  // Drop-off — full Address row (so we get postal_code, lat/lng, etc.).
+  dropoffAddressId     String
+  dropoffAddress       Address @relation("OrderDropoff", fields: [dropoffAddressId], references: [id])
   deliveryInstructions String?
+
+  // Scheduling.
+  deliveryTiming DeliveryTiming @default(ASAP)
+  scheduledAt    DateTime? // when the buyer wants the food ready / delivered
+  expectedAt     DateTime? // server-computed ETA (placedAt + prep + delivery)
+
+  // Free-text note from the buyer ("ring twice", "no nuts please", …).
+  note String?
+
+  // Stripe PaymentIntent for this order. Set after the PI is created.
+  // Backfilled by the webhook handler if the post-create update fails.
+  stripePaymentIntentId String? @unique
+
+  // Idempotency flag for the inventory restoration on payment_failed /
+  // canceled webhooks AND seller cancellations — all paths can fire
+  // multiple times.
+  inventoryRestored Boolean @default(false)
+
+  // Set when a Stripe refund has been initiated for this order (seller
+  // cancel today; admin/buyer refunds in future slices). Guards against
+  // double-refunding on retried calls.
+  stripeRefundId String?   @unique
+  refundedAt     DateTime?
+
+  // Set when funds are released to the seller after delivery completes
+  // (separate-charges → manual transfer pattern). Guards against
+  // double-paying on retried calls.
+  stripeTransferId       String?   @unique
+  // Driver's payout (the fulfillment fee). Null for PICKUP orders.
+  stripeDriverTransferId String?   @unique
+  transferredAt          DateTime?
 
   // Lifecycle timestamps. status is the source of truth; these mirror it for
   // analytics and SLA reporting.
@@ -369,10 +658,60 @@ model Order {
 
   items      OrderItem[]
   deliveries Delivery[]
+  review     Review?
 
   @@index([buyerId, createdAt(sort: Desc)])
   @@index([sellerId, createdAt(sort: Desc)])
   @@index([status, createdAt])
+}
+
+model Review {
+  id String @id
+
+  // One review per order (UNIQUE FK). Cascades nothing — financial rows
+  // are hard-delete-forbidden by policy, so the order will never disappear
+  // out from under the review.
+  orderId String @unique
+  order   Order  @relation(fields: [orderId], references: [id])
+
+  authorId String
+  author   User   @relation("ReviewAuthor", fields: [authorId], references: [id])
+
+  // FK to SellerProfile.userId (the seller's user_id PK).
+  sellerId String
+  seller   SellerProfile @relation("SellerReviews", fields: [sellerId], references: [userId])
+
+  // Overall 1–5 stars. Doc references `reviews.rating` even though the
+  // table schema doesn't list it — adding here for per-review display
+  // and for the cached SellerProfile.averageRating denormalization.
+  rating Int
+
+  body         String
+  helpfulCount Int    @default(0)
+
+  createdAt DateTime @default(now())
+
+  criteriaRatings ReviewCriterionRating[]
+
+  @@index([sellerId, createdAt(sort: Desc)])
+  @@index([authorId, createdAt(sort: Desc)])
+}
+
+model ReviewCriterionRating {
+  reviewId String
+  review   Review @relation(fields: [reviewId], references: [id], onDelete: Cascade)
+
+  criterion RatingCriterion
+
+  // numeric(4,1) accommodates both score5 (0–5 with one decimal) and
+  // percent (0–100). value_type is fixed by criterion at the application
+  // boundary — not stored.
+  value       Decimal @db.Decimal(4, 1)
+  // Number of underlying observations for this criterion. Defaults to 1
+  // for a per-review rating; reserved for potential weighted aggregations.
+  sampleCount Int     @default(1)
+
+  @@id([reviewId, criterion])
 }
 
 model OrderItem {
@@ -383,18 +722,37 @@ model OrderItem {
   listingId String
   listing   Listing @relation(fields: [listingId], references: [id])
 
-  // Listing snapshot — keeps order history readable even if the listing is
-  // edited or deleted later.
-  listingTitle   String
-  listingImage   String?
-  unitPriceCents Int
-  quantity       Int
-  subtotalCents  Int
+  // Listing snapshots — frozen at order creation so historical orders stay
+  // readable after listing edits/deletes. Names match BACKEND_SCHEMA.md.
+  listingNameSnapshot     String
+  listingImageUrlSnapshot String?
+  unitPriceCentsSnapshot  Int
+
+  quantity Int
+  // Free-text per-item note from the buyer ("no onions").
+  note     String?
 
   createdAt DateTime @default(now())
 
+  addOns OrderItemAddOn[]
+
   @@index([orderId])
   @@index([listingId])
+}
+
+model OrderItemAddOn {
+  // Snapshot of a ListingAddOn at order time. Lives on its own row (not
+  // a JSON column) so we can sum/aggregate addons in reports if needed.
+  id          String    @id
+  orderItemId String
+  orderItem   OrderItem @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+
+  labelSnapshot           String
+  priceDeltaCentsSnapshot Int
+
+  createdAt DateTime @default(now())
+
+  @@index([orderItemId])
 }
 
 // -------- Fulfillment --------
@@ -407,7 +765,7 @@ model Delivery {
   // Null while in SEARCHING/UNASSIGNED. A failed delivery may be reassigned
   // by inserting a new Delivery row pointing at the same Order.
   driverId String?
-  driver   DriverProfile? @relation(fields: [driverId], references: [id])
+  driver   DriverProfile? @relation(fields: [driverId], references: [userId])
 
   status DeliveryStatus @default(UNASSIGNED)
 
@@ -425,9 +783,40 @@ model Delivery {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  issues OrderIssue[]
+
   @@index([orderId])
   @@index([driverId, status])
   @@index([status])
+}
+
+model OrderIssue {
+  // Driver-reported issue mid-delivery. Doc: order_issues.
+  id String @id
+
+  // FK to Delivery (not directly to Order) — ties the report to the
+  // specific assignment. Order is reachable via delivery.order.
+  deliveryId String
+  delivery   Delivery @relation(fields: [deliveryId], references: [id], onDelete: Cascade)
+
+  // The driver who filed it. Required.
+  driverId String
+  driver   DriverProfile @relation("DriverOrderIssues", fields: [driverId], references: [userId])
+
+  // Free-text catalog code from issue_catalog.dart on the Flutter side
+  // ("restaurant_closed", "buyer_unreachable", …). Not enumerated here —
+  // catalog grows fast and we don't want a migration per code.
+  issueCode         String
+  severity          IssueSeverity
+  // Order status at the moment the issue was reported (for analytics).
+  stageWhenReported OrderStatus
+  freeText          String?
+
+  reportedAt DateTime @default(now())
+
+  @@index([deliveryId])
+  @@index([driverId, reportedAt(sort: Desc)])
+  @@index([severity])
 }
 
 // -------- Platform plumbing --------

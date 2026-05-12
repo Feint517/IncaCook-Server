@@ -13,6 +13,8 @@ import {
 import { UserRole } from '@common/enums/user-role.enum';
 
 import { CreateBuyerProfileDto } from './create-buyer-profile.dto';
+import { CreateDriverProfileDto } from './create-driver-profile.dto';
+import { CreateSellerProfileDto } from './create-seller-profile.dto';
 
 const SIGNUP_ROLES = [UserRole.Buyer, UserRole.Seller, UserRole.Driver] as const;
 type SignupRole = (typeof SIGNUP_ROLES)[number];
@@ -24,9 +26,9 @@ type SignupRole = (typeof SIGNUP_ROLES)[number];
  *
  * Admin/Moderator roles are not assignable through this endpoint.
  *
- * Role-specific blocks (`buyerProfile`) are validated structurally here and
- * gated against `role` at the service layer — sending `buyerProfile` with a
- * non-buyer role is a 400.
+ * Role-specific blocks (`buyerProfile`, `sellerProfile`) are validated
+ * structurally here and gated against `role` at the service layer —
+ * sending the wrong block for the role is a 400.
  */
 export class CreateUserDto {
   @IsString()
@@ -56,4 +58,14 @@ export class CreateUserDto {
   @ValidateNested()
   @Type(() => CreateBuyerProfileDto)
   buyerProfile?: CreateBuyerProfileDto;
+
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => CreateSellerProfileDto)
+  sellerProfile?: CreateSellerProfileDto;
+
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => CreateDriverProfileDto)
+  driverProfile?: CreateDriverProfileDto;
 }

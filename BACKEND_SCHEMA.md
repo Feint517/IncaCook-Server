@@ -44,6 +44,7 @@ role = creating a new account in production).
 | accepted_cgu | `bool` | `accepted_cgu` | `bool` | terms of use |
 | accepted_cgv | `bool` | `accepted_cgv` | `bool` | terms of sale |
 | accepted_at | `DateTime?` | `accepted_at` | `timestamptz` | |
+| stripe_customer_id | `String?` | `stripe_customer_id` | `text` | populated as a side effect of the buyer's first payment — not collected at signup |
 | created_at | `DateTime` | `created_at` | `timestamptz` | |
 | updated_at | `DateTime` | `updated_at` | `timestamptz` | |
 
@@ -90,7 +91,7 @@ Source: signup_flow_controller `dietaryPreferences` + `allergies` + `deliveryAdd
 | dish_types | `List<DishType>` | `dish_types` | `dish_type[]` | |
 | hygiene_commitment | `bool` | `hygiene_commitment` | `bool` | |
 | fait_maison_commitment | `bool` | `fait_maison_commitment` | `bool` | |
-| kyc_status | `KycStatus` | `kyc_status` | enum `kyc_status` | pending \| approved \| rejected |
+| kyc_status | `KycStatus` | `kyc_status` | enum `kyc_status` | pending \| approved \| rejected. **Defaults**: `fait_maison` → `approved` (auto-approved on signup); `traiteur` / `restaurant` → `pending` (admin reviews SIRET + KYC docs + facade). Implement via `INSERT` trigger that branches on `category`. |
 | location | `MapPoint` | `location` | `geography(Point, 4326)` | denormalized from pickup address for radius queries |
 | delivery_radius_km | `double` | `delivery_radius_km` | `numeric(4,1)` | |
 | delivery_fee | `double` | `delivery_fee` | `numeric(10,2)` | |
@@ -102,9 +103,32 @@ Source: signup_flow_controller `dietaryPreferences` + `allergies` + `deliveryAdd
 | verifications | `List<String>` | `verifications` | `text[]` | badge keys |
 | promo_text | `String?` | `promo_text` | `text` | optional banner |
 | category_tag | `String` | `category_tag` | `text` | "Cuisinière à domicile", etc. |
+| stripe_connect_account_id | `String?` | `stripe_connect_account_id` | `text` | nullable until seller completes Stripe Express onboarding |
+| stripe_onboarding_completed | `bool` | `stripe_onboarding_completed` | `bool` | default `false`; flipped by the `account.updated` Stripe webhook |
 | created_at | | | `timestamptz` | |
 
 Source: [seller_profile.dart](lib/core/models/seller_profile.dart) (canonical fields only — aggregates live in `seller_stats`), signup_flow_controller seller-specific section.
+
+**Pending-state behavior** (no UI screen, schema-only):
+The signup flow drops the seller straight into the seller home — there is
+no "account under review" screen
+([signup_flow_controller.dart:439](lib/features/authentication/controllers/signup_flow_controller.dart#L439)).
+The pending state is enforced *server-side* via a **listing visibility
+gate**: a `pending` seller can sign in, edit their profile, and upload
+listings, but those listings are hidden from the buyer feed until
+`kyc_status = 'approved'`. RLS / view filter on `listings`:
+```sql
+-- in any buyer-facing query against listings
+WHERE EXISTS (
+  SELECT 1 FROM seller_profiles sp
+  WHERE sp.user_id = listings.seller_id
+    AND sp.kyc_status = 'approved'
+)
+```
+
+The same gate applies to `driver_profiles.kyc_status`: a `pending` driver
+should not be auto-assigned to orders. Enforce in the assignment query,
+not at sign-in (the driver still needs to access their dashboard).
 
 ### `seller_opening_hours` — 1:N with seller_profiles (restaurants only)
 
@@ -128,8 +152,8 @@ Source: [time_range.dart](lib/features/authentication/data/models/time_range.dar
 | base_address_id | `String` | `base_address_id` | `uuid` FK → addresses.id | |
 | vehicle_type | `DriverVehicleType` | `vehicle_type` | enum `driver_vehicle_type` | bicycle \| scooter \| car |
 | operating_zones | `List<String>` | `operating_zones` | `text[]` | neighborhood names; consider FK to a `zones` table later |
-| iban | `String` | `iban` | `text` | encrypt at rest |
-| iban_holder_name | `String` | `iban_holder_name` | `text` | |
+| stripe_connect_account_id | `String?` | `stripe_connect_account_id` | `text` | nullable until driver completes Stripe Express onboarding |
+| stripe_onboarding_completed | `bool` | `stripe_onboarding_completed` | `bool` | default `false`. Flipped by the `account.updated` Stripe webhook when `charges_enabled && payouts_enabled && details_submitted`. |
 | charter_accepted | `bool` | `charter_accepted` | `bool` | |
 | punctuality_commitment | `bool` | `punctuality_commitment` | `bool` | |
 | care_commitment | `bool` | `care_commitment` | `bool` | |
@@ -340,22 +364,34 @@ also snapshotted, since add-ons can be edited.
 The Dart `PaymentMethod` is a **freezed sealed union** with five variants.
 Recommended: ONE table with a discriminator column.
 
+Card details (number, full expiry, etc.) are NOT stored — Stripe holds
+them. We keep a tokenized reference plus a couple of *display-only* mirrors
+that get refreshed when the buyer adds or updates a card. PCI scope stays
+on Stripe's side.
+
 | Field | Dart | JSON | Postgres |
 |---|---|---|---|
 | id | `String` | `id` | `uuid` PK |
 | user_id | | `user_id` | `uuid` FK → users.id |
 | kind | (variant tag) | `kind` | enum `payment_method_kind` |
-| last4 | `String?` | `last4` | `text` |
-| expiry | `String?` | `expiry` | `text` |
-| brand | `String?` | `brand` | `text` |
-| masked_email | `String?` | `masked_email` | `text` |
-| wallet_balance | `double?` | `wallet_balance` | `numeric(10,2)` |
-| processor_ref | | `processor_ref` | `text` | Stripe / PayPal token |
+| stripe_payment_method_id | `String?` | `stripe_payment_method_id` | `text` | `pm_xxx` for cards / Apple Pay / Google Pay |
+| display_brand | `String?` | `display_brand` | `text` | UI mirror — "Visa" / "Mastercard" |
+| display_last4 | `String?` | `display_last4` | `text` | UI mirror — "4242" |
+| display_expiry | `String?` | `display_expiry` | `text` | UI mirror — "12/26" |
+| masked_email | `String?` | `masked_email` | `text` | for `paypal` |
+| wallet_balance | `double?` | `wallet_balance` | `numeric(10,2)` | for `wallet` |
+| is_default | `bool` | `is_default` | `bool` | one-per-user via partial unique index |
 | created_at | | `created_at` | `timestamptz` |
 
 `payment_method_kind` enum: `wallet`, `saved_card`, `paypal`, `apple_pay`,
 `google_pay`. The discriminator key on the wire is `kind` (configured via
 `@FreezedUnionValue` in [payment_method.dart](lib/core/models/payment_method.dart)).
+
+**Note on the freezed model**: the current Dart class still has `last4` /
+`expiry` / `brand` as direct factory params for `SavedCardPaymentMethod`.
+When the Stripe wiring lands, those become the `display_*` mirrors above
+and a new `stripePaymentMethodId` field is added to the union. Until then
+the model stays as-is so existing call sites keep compiling.
 
 ### `payments` — actual payment events
 
@@ -531,6 +567,58 @@ Recommended bucket layout:
 | `kyc` | ID front/back, selfies, driving license, carte grise, insurance | **Private**: owner + reviewers only |
 
 URL columns on the database (`profile_photo_url`, `id_front_url`, etc.) hold the **object key** within the bucket, e.g. `kyc/<user_id>/id-front.jpg`. Resolve to a signed URL at read time.
+
+---
+
+## 8.5. Stripe Connect (payouts)
+
+Sellers and drivers receive money via **Stripe Connect Express**. The
+platform never stores a raw IBAN — Stripe captures bank details, KYC
+docs, ToS acceptance, and tax info during their hosted onboarding flow.
+The Dart signup flow does **not** include a payout step (the IBAN page
+was deleted): users complete app signup, land on their dashboard, and
+see a `PayoutSetupBanner` prompting them to finish payout setup.
+
+**Buyers** never create a Stripe Connect account. They become regular
+Stripe Customers as a side effect of their first payment; the resulting
+`stripe_customer_id` is written to `users` automatically.
+
+### Dual-gate model
+
+A seller / driver record has **two independent gates**:
+
+| Gate | Default | Source of truth | What it blocks |
+|---|---|---|---|
+| `kyc_status` | `pending` (or `approved` for `fait_maison`) | Internal admin reviewer | Listing visibility / driver assignment |
+| `stripe_onboarding_completed` | `false` | Stripe webhook (`account.updated`) when `charges_enabled && payouts_enabled && details_submitted` | Receiving payouts |
+
+The two are independent — a seller may be KYC-approved but
+Stripe-incomplete (orders accepted, payouts queued by Stripe) or vice
+versa. Both gates must pass for the user to be a fully-active marketplace
+participant.
+
+### Required webhooks (Supabase Edge Function)
+
+Subscribe at minimum to:
+
+- `account.updated` → flip `stripe_onboarding_completed` true/false
+- `account.application.deauthorized` → unset both `stripe_connect_account_id` and `stripe_onboarding_completed`
+- `payment_intent.succeeded` → finalize the corresponding `payments` row
+- `payout.paid` / `payout.failed` → log to a `payout_events(driver_or_seller_id, status, amount, arrived_at)` audit table
+
+### Env vars (server-side only — never in Flutter)
+
+- `STRIPE_PUBLISHABLE_KEY` — client-safe
+- `STRIPE_SECRET_KEY` — server only
+- `STRIPE_WEBHOOK_SECRET` — server only
+- `STRIPE_CONNECT_CLIENT_ID` — for OAuth-style flows if used
+
+### Deep links
+
+Define two URL-scheme deep links so Stripe's hosted onboarding can return
+to the app: `incacook://payout/return` (success) and
+`incacook://payout/refresh` (re-create the link). Register both in
+iOS `Info.plist` and Android `AndroidManifest.xml`.
 
 ---
 

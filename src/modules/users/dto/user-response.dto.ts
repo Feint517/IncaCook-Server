@@ -3,13 +3,15 @@ import type { User } from '@prisma/client';
 import { UserRole } from '@common/enums/user-role.enum';
 
 import { BuyerProfileResponseDto } from './buyer-profile-response.dto';
+import { DriverProfileResponseDto } from './driver-profile-response.dto';
+import { SellerProfileResponseDto } from './seller-profile-response.dto';
 
 /**
  * Public shape returned by `GET /v1/users/me` and `POST /v1/users`.
  * Excludes internal fields (supabaseId, deletedAt, terms-acceptance flags).
  *
- * `buyerProfile` is populated when the user has role = BUYER. Seller and
- * driver profiles will join here in their respective signup slices.
+ * Exactly one of `buyerProfile` / `sellerProfile` / `driverProfile` is
+ * populated, matching the user's role.
  */
 export class UserResponseDto {
   id!: string;
@@ -24,8 +26,17 @@ export class UserResponseDto {
   createdAt!: Date;
 
   buyerProfile?: BuyerProfileResponseDto;
+  sellerProfile?: SellerProfileResponseDto;
+  driverProfile?: DriverProfileResponseDto;
 
-  static from(user: User, buyerProfile?: BuyerProfileResponseDto): UserResponseDto {
+  static from(
+    user: User,
+    profiles: {
+      buyerProfile?: BuyerProfileResponseDto;
+      sellerProfile?: SellerProfileResponseDto;
+      driverProfile?: DriverProfileResponseDto;
+    } = {},
+  ): UserResponseDto {
     return {
       id: user.id,
       email: user.email,
@@ -37,7 +48,9 @@ export class UserResponseDto {
       emailVerified: user.emailVerified,
       phoneVerified: user.phoneVerified,
       createdAt: user.createdAt,
-      ...(buyerProfile !== undefined ? { buyerProfile } : {}),
+      ...(profiles.buyerProfile !== undefined ? { buyerProfile: profiles.buyerProfile } : {}),
+      ...(profiles.sellerProfile !== undefined ? { sellerProfile: profiles.sellerProfile } : {}),
+      ...(profiles.driverProfile !== undefined ? { driverProfile: profiles.driverProfile } : {}),
     };
   }
 }

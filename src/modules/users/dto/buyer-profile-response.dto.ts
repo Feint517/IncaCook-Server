@@ -1,13 +1,13 @@
 import type { BuyerProfile } from '@prisma/client';
 
 import { Allergen } from '@common/enums/allergen.enum';
-import { Dietary } from '@common/enums/dietary.enum';
+import { DietaryTag } from '@common/enums/dietary-tag.enum';
 
 import { AddressResponseDto } from './address-response.dto';
 
 export class BuyerProfileResponseDto {
   defaultAddress!: AddressResponseDto | null;
-  dietaryPreferences!: Dietary[];
+  dietaryPreferences!: DietaryTag[];
   allergies!: Allergen[];
 
   static from(
@@ -16,7 +16,7 @@ export class BuyerProfileResponseDto {
   ): BuyerProfileResponseDto {
     return {
       defaultAddress,
-      dietaryPreferences: profile.dietaryPreferences as Dietary[],
+      dietaryPreferences: profile.dietaryPreferences as DietaryTag[],
       allergies: profile.allergies as Allergen[],
     };
   }
