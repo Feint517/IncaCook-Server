@@ -13,6 +13,7 @@ import { KycStatus } from '@common/enums/kyc-status.enum';
 import { UserRole } from '@common/enums/user-role.enum';
 import { generateUlid } from '@common/utils/code-generator.util';
 
+import { AuditService } from '@infrastructure/audit/audit.service';
 import { PrismaService } from '@infrastructure/database/prisma.service';
 
 import { OrdersService } from '@modules/orders/orders.service';
@@ -46,6 +47,7 @@ export class DeliveriesService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly orders: OrdersService,
+    private readonly audit: AuditService,
   ) {}
 
   // -----------------------------------------------------------------------
@@ -270,11 +272,24 @@ export class DeliveriesService {
     });
 
     // ABORT severity flags for admin intervention but doesn't auto-cancel
-    // (refund decisions are a human call). Just log a warning.
+    // (refund decisions are a human call). Log + persist for forensics.
     if (dto.severity === IssueSeverity.Abort) {
       this.logger.warn(
         `Driver ${driver.userId} filed ABORT issue on delivery ${deliveryId} (order ${delivery.orderId}, code ${dto.issueCode})`,
       );
+      await this.audit.record({
+        actorId: driver.userId,
+        action: 'delivery.issue_abort',
+        targetType: 'OrderIssue',
+        targetId: issue.id,
+        metadata: {
+          deliveryId,
+          orderId: delivery.orderId,
+          issueCode: dto.issueCode,
+          stageWhenReported: dto.stageWhenReported,
+          freeText: dto.freeText ?? null,
+        },
+      });
     }
 
     return { id: issue.id, severity: issue.severity as IssueSeverity };

@@ -85,6 +85,7 @@
     "helmet": "^8.0.0",
     "ioredis": "^5.4.2",
     "jsonwebtoken": "^9.0.2",
+    "jwks-rsa": "^4.0.1",
     "lodash": "^4.17.21",
     "nanoid": "^5.0.9",
     "nestjs-pino": "^4.2.0",

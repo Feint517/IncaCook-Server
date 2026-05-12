@@ -22,7 +22,7 @@ if (!STRIPE_SECRET_KEY.startsWith('sk_test_')) {
   process.exit(1);
 }
 
-const stripe = new Stripe(STRIPE_SECRET_KEY, { apiVersion: '2024-12-18.acacia' });
+const stripe = new Stripe(STRIPE_SECRET_KEY, { apiVersion: '2025-02-24.acacia' });
 
 const RETURN_URL = 'http://localhost:3000/stub/stripe/return';
 const REFRESH_URL = 'http://localhost:3000/stub/stripe/refresh';

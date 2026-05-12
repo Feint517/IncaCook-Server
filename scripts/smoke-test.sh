@@ -195,6 +195,18 @@ O_STATUS=$(db_query "SELECT status FROM \"Order\" WHERE id = '$ORDER_ID'")
 [ "$O_STATUS" = "IN_DELIVERY" ] || fail "Expected order IN_DELIVERY got $O_STATUS"
 ok "Delivery → PICKED_UP,  Order → IN_DELIVERY"
 
+step "Driver: report ABORT issue mid-delivery (admin-review-only, no auto-cancel)"
+ISSUE_RESPONSE=$(curl -sf -X POST "$BASE_URL/v1/drivers/me/deliveries/$DELIVERY_ID/report-issue" \
+  -H "Authorization: Bearer $DRIVER" -H "Content-Type: application/json" \
+  -d '{"issueCode":"buyer_unreachable","severity":"ABORT","stageWhenReported":"IN_DELIVERY","freeText":"smoke test"}')
+ISSUE_ID=$(json_get "$ISSUE_RESPONSE" "['data']['id']")
+[ -n "$ISSUE_ID" ] || fail "No issue id returned"
+D_STATUS=$(db_query "SELECT status FROM \"Delivery\" WHERE id = '$DELIVERY_ID'")
+[ "$D_STATUS" = "PICKED_UP" ] || fail "Delivery status should be unchanged at PICKED_UP, got $D_STATUS"
+AUDIT_HIT=$(db_query "SELECT COUNT(*) FROM \"AuditLog\" WHERE action = 'delivery.issue_abort' AND \"targetId\" = '$ISSUE_ID'")
+[ "$AUDIT_HIT" = "1" ] || fail "Expected 1 audit row for issue $ISSUE_ID, got $AUDIT_HIT"
+ok "OrderIssue $ISSUE_ID persisted, delivery still PICKED_UP, AuditLog row recorded"
+
 step "Driver: confirm-delivery (triggers Stripe transfers to seller + driver)"
 curl -sf -X POST "$BASE_URL/v1/drivers/me/deliveries/$DELIVERY_ID/confirm-delivery" \
   -H "Authorization: Bearer $DRIVER" > /dev/null

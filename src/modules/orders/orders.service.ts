@@ -17,6 +17,7 @@ import { KycStatus } from '@common/enums/kyc-status.enum';
 import { OrderStatus } from '@common/enums/order-status.enum';
 import { generateOrderCode, generateUlid } from '@common/utils/code-generator.util';
 
+import { AuditService } from '@infrastructure/audit/audit.service';
 import { PrismaService } from '@infrastructure/database/prisma.service';
 import { StripeService } from '@infrastructure/stripe/stripe.service';
 
@@ -43,6 +44,7 @@ export class OrdersService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly stripe: StripeService,
+    private readonly audit: AuditService,
   ) {}
 
   /**
@@ -441,10 +443,31 @@ export class OrdersService {
             transferredAt: new Date(),
           },
         });
+        await this.audit.record({
+          actorId: null,
+          action: 'order.transfer_seller',
+          targetType: 'Order',
+          targetId: orderId,
+          metadata: {
+            transferId: transfer.id,
+            amountCents: order.sellerEarningsCents,
+            destination: seller.stripeConnectAccountId,
+          },
+        });
       } catch (err) {
-        this.logger.error(
-          `Seller transfer failed for order ${orderId}: ${(err as Error).message}`,
-        );
+        const message = (err as Error).message;
+        this.logger.error(`Seller transfer failed for order ${orderId}: ${message}`);
+        await this.audit.record({
+          actorId: null,
+          action: 'order.transfer_seller.failed',
+          targetType: 'Order',
+          targetId: orderId,
+          metadata: {
+            amountCents: order.sellerEarningsCents,
+            destination: seller.stripeConnectAccountId,
+            error: message,
+          },
+        });
       }
     }
 
@@ -474,10 +497,33 @@ export class OrdersService {
             where: { id: orderId },
             data: { stripeDriverTransferId: transfer.id },
           });
+          await this.audit.record({
+            actorId: null,
+            action: 'order.transfer_driver',
+            targetType: 'Order',
+            targetId: orderId,
+            metadata: {
+              transferId: transfer.id,
+              amountCents: order.fulfillmentFeeCents,
+              destination: driver.stripeConnectAccountId,
+              driverId,
+            },
+          });
         } catch (err) {
-          this.logger.error(
-            `Driver transfer failed for order ${orderId}: ${(err as Error).message}`,
-          );
+          const message = (err as Error).message;
+          this.logger.error(`Driver transfer failed for order ${orderId}: ${message}`);
+          await this.audit.record({
+            actorId: null,
+            action: 'order.transfer_driver.failed',
+            targetType: 'Order',
+            targetId: orderId,
+            metadata: {
+              amountCents: order.fulfillmentFeeCents,
+              destination: driver.stripeConnectAccountId,
+              driverId,
+              error: message,
+            },
+          });
         }
       } else {
         this.logger.error(
@@ -562,6 +608,14 @@ export class OrdersService {
           inventoryRestored: true,
         },
       });
+    });
+
+    await this.audit.record({
+      actorId: sellerId,
+      action: 'order.cancel_by_seller',
+      targetType: 'Order',
+      targetId: orderId,
+      metadata: { reason, fromStatus: existing.status },
     });
 
     // Step 2: refund. Idempotent — skip if we already have a refund id.
@@ -1123,9 +1177,21 @@ export class OrdersService {
         metadata: { orderId },
       });
     } catch (err) {
+      const message = (err as Error).message;
       this.logger.error(
-        `Refund creation failed for order ${orderId}: ${(err as Error).message}. Order stays CANCELLED; manual reconciliation required.`,
+        `Refund creation failed for order ${orderId}: ${message}. Order stays CANCELLED; manual reconciliation required.`,
       );
+      await this.audit.record({
+        actorId: null,
+        action: 'order.refund.failed',
+        targetType: 'Order',
+        targetId: orderId,
+        metadata: {
+          paymentIntentId: order.stripePaymentIntentId,
+          amountCents: order.buyerTotalCents,
+          error: message,
+        },
+      });
       return;
     }
 
@@ -1144,5 +1210,17 @@ export class OrdersService {
         `Refund ${refund.id} for order ${orderId} succeeded in Stripe but DB update failed: ${(err as Error).message}`,
       );
     }
+
+    await this.audit.record({
+      actorId: null,
+      action: 'order.refund',
+      targetType: 'Order',
+      targetId: orderId,
+      metadata: {
+        refundId: refund.id,
+        paymentIntentId: order.stripePaymentIntentId,
+        amountCents: order.buyerTotalCents,
+      },
+    });
   }
 }
