@@ -27,10 +27,22 @@ interface PaginatedPayload<T> {
 }
 
 function isPaginated<T>(value: unknown): value is PaginatedPayload<T> {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+  const v = value as Record<string, unknown>;
+  // Needs an `items` array AND at least one pagination signal — otherwise
+  // any DTO with a sub-collection field named `items` (e.g. OrderResponseDto)
+  // gets falsely hoisted, returning the items as the top-level response.
+  if (!Array.isArray(v.items)) {
+    return false;
+  }
   return (
-    Boolean(value) &&
-    typeof value === 'object' &&
-    Array.isArray((value as { items?: unknown }).items)
+    v.hasMore !== undefined ||
+    v.total !== undefined ||
+    v.nextCursor !== undefined ||
+    v.page !== undefined ||
+    v.limit !== undefined
   );
 }
 
