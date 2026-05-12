@@ -37,8 +37,13 @@ const TEST_EMAILS = {
   driver: 'test+driver@incacook.test',
 } as const;
 
-const FAKE_STRIPE_CONNECT_SELLER = 'acct_test_seed_seller';
-const FAKE_STRIPE_CONNECT_DRIVER = 'acct_test_seed_driver';
+// Prefer real test-mode Express Connect IDs from env (set in .env.test by
+// scripts/setup-stripe-test-accounts.ts). Falls back to obvious placeholders
+// if unset — those make transfers fail, which is fine for non-payout tests.
+const SEED_STRIPE_CONNECT_SELLER =
+  process.env.TEST_SELLER_STRIPE_ACCOUNT_ID ?? 'acct_test_seed_seller';
+const SEED_STRIPE_CONNECT_DRIVER =
+  process.env.TEST_DRIVER_STRIPE_ACCOUNT_ID ?? 'acct_test_seed_driver';
 
 async function main(): Promise<void> {
   console.log('Wiping prior seeded data...');
@@ -147,7 +152,7 @@ async function main(): Promise<void> {
       neighborhood: 'Marais, Paris 4ème',
       languageCodes: ['fr', 'en'],
       categoryTag: 'Cuisinière à domicile',
-      stripeConnectAccountId: FAKE_STRIPE_CONNECT_SELLER,
+      stripeConnectAccountId: SEED_STRIPE_CONNECT_SELLER,
       stripeOnboardingCompleted: true,
     },
   });
@@ -198,7 +203,7 @@ async function main(): Promise<void> {
       // Manually approve KYC for the test driver (real drivers go through
       // admin review). Stripe Connect onboarding faked.
       kycStatus: 'APPROVED',
-      stripeConnectAccountId: FAKE_STRIPE_CONNECT_DRIVER,
+      stripeConnectAccountId: SEED_STRIPE_CONNECT_DRIVER,
       stripeOnboardingCompleted: true,
       isOnline: true,
     },

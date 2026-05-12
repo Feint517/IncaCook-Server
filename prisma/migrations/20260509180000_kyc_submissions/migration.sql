@@ -64,6 +64,12 @@ ALTER TABLE "KycSubmission"
 -- admin/moderator reviewers.
 -- ============================================================
 
+DROP POLICY IF EXISTS "kyc_owner_select" ON storage.objects;
+DROP POLICY IF EXISTS "kyc_owner_insert" ON storage.objects;
+DROP POLICY IF EXISTS "kyc_owner_update" ON storage.objects;
+DROP POLICY IF EXISTS "kyc_owner_delete" ON storage.objects;
+DROP POLICY IF EXISTS "kyc_reviewer_select" ON storage.objects;
+
 CREATE POLICY "kyc_owner_select" ON storage.objects
     FOR SELECT TO authenticated
     USING (

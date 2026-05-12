@@ -121,6 +121,11 @@ ALTER TABLE "ListingAddOn"
 -- dashboard. Policies attach to storage.objects regardless.
 -- ============================================================
 
+DROP POLICY IF EXISTS "listings_public_select" ON storage.objects;
+DROP POLICY IF EXISTS "listings_owner_insert" ON storage.objects;
+DROP POLICY IF EXISTS "listings_owner_update" ON storage.objects;
+DROP POLICY IF EXISTS "listings_owner_delete" ON storage.objects;
+
 CREATE POLICY "listings_public_select" ON storage.objects
     FOR SELECT TO anon, authenticated
     USING (bucket_id = 'listings');
