@@ -1,11 +1,12 @@
 import { Module } from '@nestjs/common';
 
-import { KycSubmissionsController } from './kyc/kyc-submissions.controller';
-import { KycSubmissionsService } from './kyc/kyc-submissions.service';
+import { ChartersController } from './charters/charters.controller';
+import { KycDocumentsController } from './kyc/kyc-documents.controller';
+import { KycDocumentsService } from './kyc/kyc-documents.service';
 
 @Module({
-  controllers: [KycSubmissionsController],
-  providers: [KycSubmissionsService],
-  exports: [KycSubmissionsService],
+  controllers: [ChartersController, KycDocumentsController],
+  providers: [KycDocumentsService],
+  exports: [KycDocumentsService],
 })
 export class ComplianceModule {}

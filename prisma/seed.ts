@@ -5,19 +5,35 @@
  *
  *   pnpm tsx prisma/seed.ts
  *
+ * Post-Phase A the data model assumes role profile rows are created as
+ * empty stubs at Gate 2 and then progressively filled in via per-concept
+ * PUT endpoints. The seed is the only place that fast-forwards a user all
+ * the way to "fully onboarded" without going through the wizard — it
+ * writes directly to the role profile, SellerBusiness, SellerCuisine,
+ * SellerDish, DriverZone, KycDocument, UserCharter, and Address (with
+ * kind) tables so the smoke test has a complete user to act as.
+ *
  * What it creates:
  *   - 1 admin user
- *   - 1 buyer with BuyerProfile + default address (Bastille, Paris 11)
- *   - 1 seller (FAIT_MAISON, auto-approved KYC) with pickup address
- *     (Marais, Paris 4) + 3 listings
- *   - 1 driver (KYC=APPROVED) with base address + bicycle vehicle
+ *   - 1 buyer with BuyerProfile + a BUYER_DELIVERY Address (Bastille)
+ *   - 1 seller (FAIT_MAISON, auto-approved KYC) with a SELLER_PICKUP
+ *     Address (Marais), cuisines/dishes joins, charters, 3 listings.
+ *     Fait-maison sellers have no SellerBusiness row.
+ *   - 1 driver (KYC=APPROVED) with a DRIVER_HOME Address, BICYCLE vehicle,
+ *     three zone rows, charters, all three KYC documents APPROVED.
  *
- * Stripe identifiers are fake placeholders — payment-related flows that
- * actually hit Stripe will fail with these IDs. For end-to-end Stripe
- * smoke tests, manually create real test-mode Connect accounts.
+ * Stripe Connect IDs come from .env.test (real test-mode accounts) when
+ * set; otherwise fall back to obvious placeholders that make transfers
+ * fail (fine for non-payout tests).
  */
 
-import { PrismaClient } from '@prisma/client';
+import {
+  AddressKind,
+  CharterKind,
+  KycDocType,
+  KycStatus,
+  PrismaClient,
+} from '@prisma/client';
 import { ulid } from 'ulid';
 
 const prisma = new PrismaClient();
@@ -37,9 +53,6 @@ const TEST_EMAILS = {
   driver: 'test+driver@incacook.test',
 } as const;
 
-// Prefer real test-mode Express Connect IDs from env (set in .env.test by
-// scripts/setup-stripe-test-accounts.ts). Falls back to obvious placeholders
-// if unset — those make transfers fail, which is fine for non-payout tests.
 const SEED_STRIPE_CONNECT_SELLER =
   process.env.TEST_SELLER_STRIPE_ACCOUNT_ID ?? 'acct_test_seed_seller';
 const SEED_STRIPE_CONNECT_DRIVER =
@@ -66,7 +79,7 @@ async function main(): Promise<void> {
     },
   });
 
-  console.log('Creating buyer + default address + profile...');
+  console.log('Creating buyer + BUYER_DELIVERY address + profile...');
   const buyerId = ulid();
   const buyerAddressId = ulid();
   await prisma.user.create({
@@ -87,6 +100,7 @@ async function main(): Promise<void> {
     data: {
       id: buyerAddressId,
       userId: buyerId,
+      kind: AddressKind.BUYER_DELIVERY,
       type: 'HOME',
       fullAddress: '12 rue de la Bastille',
       city: 'Paris',
@@ -97,7 +111,6 @@ async function main(): Promise<void> {
   await prisma.buyerProfile.create({
     data: {
       userId: buyerId,
-      defaultAddressId: buyerAddressId,
       dietaryPreferences: ['HALAL'],
       allergies: ['ARACHIDES'],
     },
@@ -124,14 +137,13 @@ async function main(): Promise<void> {
     data: {
       id: sellerAddressId,
       userId: sellerId,
+      kind: AddressKind.SELLER_PICKUP,
       fullAddress: '5 rue des Rosiers',
       city: 'Paris',
       postalCode: '75004',
     },
   });
   await setAddressPoint(sellerAddressId, 48.857, 2.359);
-  // FAIT_MAISON auto-approves via the INSERT trigger — we still set
-  // kycStatus explicitly for clarity. Stripe Connect onboarding is faked.
   await prisma.sellerProfile.create({
     data: {
       userId: sellerId,
@@ -140,9 +152,6 @@ async function main(): Promise<void> {
       bio: 'Cuisinière à domicile pour les tests',
       profilePhotoUrl: 'avatars/test-seller.jpg',
       dateOfBirth: new Date('1985-03-12'),
-      pickupAddressId: sellerAddressId,
-      cuisineTypes: ['FRANCAISE', 'ORIENTALE'],
-      dishTypes: ['PLAT', 'DESSERT'],
       hygieneCommitment: true,
       faitMaisonCommitment: true,
       deliveryRadiusKm: 5,
@@ -152,6 +161,7 @@ async function main(): Promise<void> {
       neighborhood: 'Marais, Paris 4ème',
       languageCodes: ['fr', 'en'],
       categoryTag: 'Cuisinière à domicile',
+      kycStatus: KycStatus.APPROVED,
       stripeConnectAccountId: SEED_STRIPE_CONNECT_SELLER,
       stripeOnboardingCompleted: true,
     },
@@ -162,6 +172,28 @@ async function main(): Promise<void> {
     SET "location" = (SELECT "point" FROM "Address" WHERE "id" = ${sellerAddressId})
     WHERE "userId" = ${sellerId}
   `;
+  // Cuisine + dish joins.
+  await prisma.sellerCuisine.createMany({
+    data: [
+      { userId: sellerId, cuisineType: 'FRANCAISE' },
+      { userId: sellerId, cuisineType: 'ORIENTALE' },
+    ],
+  });
+  await prisma.sellerDish.createMany({
+    data: [
+      { userId: sellerId, dishType: 'PLAT' },
+      { userId: sellerId, dishType: 'DESSERT' },
+    ],
+  });
+  // Fait-maison sellers have no SellerBusiness row (skipped step) — that's
+  // the whole point of the fait-maison branch.
+  // Charters: hygiene + fait-maison.
+  await prisma.userCharter.createMany({
+    data: [
+      { userId: sellerId, charter: CharterKind.HYGIENE, version: 'v1.0' },
+      { userId: sellerId, charter: CharterKind.FAIT_MAISON, version: 'v1.0' },
+    ],
+  });
 
   console.log('Creating driver (KYC=APPROVED, BICYCLE)...');
   const driverId = ulid();
@@ -184,6 +216,7 @@ async function main(): Promise<void> {
     data: {
       id: driverAddressId,
       userId: driverId,
+      kind: AddressKind.DRIVER_HOME,
       fullAddress: '8 boulevard de Belleville',
       city: 'Paris',
       postalCode: '75011',
@@ -194,19 +227,59 @@ async function main(): Promise<void> {
     data: {
       userId: driverId,
       dateOfBirth: new Date('1996-04-22'),
-      baseAddressId: driverAddressId,
       vehicleType: 'BICYCLE',
-      operatingZones: ['Bastille', 'Marais', 'République'],
       charterAccepted: true,
       punctualityCommitment: true,
       careCommitment: true,
-      // Manually approve KYC for the test driver (real drivers go through
-      // admin review). Stripe Connect onboarding faked.
-      kycStatus: 'APPROVED',
+      kycStatus: KycStatus.APPROVED,
       stripeConnectAccountId: SEED_STRIPE_CONNECT_DRIVER,
       stripeOnboardingCompleted: true,
       isOnline: true,
     },
+  });
+  await prisma.driverZone.createMany({
+    data: [
+      { userId: driverId, zoneId: 'Bastille' },
+      { userId: driverId, zoneId: 'Marais' },
+      { userId: driverId, zoneId: 'République' },
+    ],
+  });
+  // Driver KYC: ID front/back + selfie, all pre-approved for the smoke test.
+  // (Bicycle → no DRIVING_LICENSE / CARTE_GRISE / INSURANCE.)
+  const driverKycMetadata = { idDocumentType: 'CARTE_IDENTITE' };
+  await prisma.kycDocument.createMany({
+    data: [
+      {
+        id: ulid(),
+        userId: driverId,
+        type: KycDocType.ID_FRONT,
+        fileUrl: 'kyc/test-driver/id-front.jpg',
+        reviewState: KycStatus.APPROVED,
+        metadata: driverKycMetadata,
+      },
+      {
+        id: ulid(),
+        userId: driverId,
+        type: KycDocType.ID_BACK,
+        fileUrl: 'kyc/test-driver/id-back.jpg',
+        reviewState: KycStatus.APPROVED,
+        metadata: driverKycMetadata,
+      },
+      {
+        id: ulid(),
+        userId: driverId,
+        type: KycDocType.SELFIE,
+        fileUrl: 'kyc/test-driver/selfie.jpg',
+        reviewState: KycStatus.APPROVED,
+      },
+    ],
+  });
+  // Driver charters: punctuality + care.
+  await prisma.userCharter.createMany({
+    data: [
+      { userId: driverId, charter: CharterKind.PUNCTUALITY, version: 'v1.0' },
+      { userId: driverId, charter: CharterKind.CARE, version: 'v1.0' },
+    ],
   });
 
   console.log('Creating sample listings...');
@@ -294,16 +367,12 @@ async function cleanup(): Promise<void> {
   }
   const userIds = users.map((u) => u.id);
 
-  // Children that don't auto-cascade with User delete.
   await prisma.bookmark.deleteMany({ where: { buyerId: { in: userIds } } });
 
-  // Reviews (criteria cascade with Review).
   await prisma.review.deleteMany({
     where: { OR: [{ authorId: { in: userIds } }, { sellerId: { in: userIds } }] },
   });
 
-  // Order chain (OrderItem + OrderItemAddOn cascade with Order;
-  // OrderIssue cascades with Delivery).
   const orders = await prisma.order.findMany({
     where: { OR: [{ buyerId: { in: userIds } }, { sellerId: { in: userIds } }] },
     select: { id: true },
@@ -314,37 +383,44 @@ async function cleanup(): Promise<void> {
     await prisma.order.deleteMany({ where: { id: { in: orderIds } } });
   }
 
-  // Idempotency keys: tied to user.
   await prisma.idempotencyKey.deleteMany({ where: { userId: { in: userIds } } });
 
-  // KYC submissions.
-  await prisma.kycSubmission.deleteMany({
+  // KYC documents (replaces KycSubmission). reviewer FK cascades on User
+  // delete with ON DELETE SET NULL, but we wipe explicitly for cleanliness.
+  await prisma.kycDocument.deleteMany({
     where: { OR: [{ userId: { in: userIds } }, { reviewerId: { in: userIds } }] },
   });
 
-  // Audit log entries by these actors.
+  // Charters by user.
+  await prisma.userCharter.deleteMany({ where: { userId: { in: userIds } } });
+
   await prisma.auditLog.deleteMany({ where: { actorId: { in: userIds } } });
 
-  // Listings + their addOns (cascade), opening hours.
+  // Listings + their addOns (cascade).
   await prisma.listing.deleteMany({ where: { sellerId: { in: userIds } } });
-  await prisma.sellerOpeningHours.deleteMany({ where: { sellerId: { in: userIds } } });
+
+  // Seller-specific child rows. Opening hours hang off SellerBusiness now;
+  // deleting SellerBusiness cascades them.
+  await prisma.sellerBusiness.deleteMany({ where: { userId: { in: userIds } } });
+  await prisma.sellerCuisine.deleteMany({ where: { userId: { in: userIds } } });
+  await prisma.sellerDish.deleteMany({ where: { userId: { in: userIds } } });
+
+  // Driver zones.
+  await prisma.driverZone.deleteMany({ where: { userId: { in: userIds } } });
 
   // Role profiles.
   await prisma.buyerProfile.deleteMany({ where: { userId: { in: userIds } } });
   await prisma.sellerProfile.deleteMany({ where: { userId: { in: userIds } } });
   await prisma.driverProfile.deleteMany({ where: { userId: { in: userIds } } });
 
-  // Addresses (after profiles release their FKs).
+  // Addresses (after profiles release their FKs — though Phase A removed
+  // the FKs from profiles to Address; still safest to wipe addresses
+  // after the things that reference them by userId).
   await prisma.address.deleteMany({ where: { userId: { in: userIds } } });
 
-  // Finally the users themselves.
   await prisma.user.deleteMany({ where: { id: { in: userIds } } });
 }
 
-/**
- * Writes the PostGIS point for an existing Address row. Prisma's Unsupported
- * geography(Point, 4326) can't be set through the standard client.
- */
 async function setAddressPoint(addressId: string, lat: number, lng: number): Promise<void> {
   await prisma.$executeRaw`
     UPDATE "Address"

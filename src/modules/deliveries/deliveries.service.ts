@@ -23,7 +23,10 @@ import { ReportIssueDto } from './dto/report-issue.dto';
 
 type DeliveryWithRelations = Delivery & {
   order: Pick<Order, 'orderNumber' | 'status' | 'fulfillmentFeeCents'> & {
-    seller: { neighborhood: string };
+    // neighborhood is nullable post-Phase-A — seller hasn't finished signup
+    // would surface as null; not a problem for drivers since deliveries are
+    // only created for sellers who can take orders (gate in orders.service).
+    seller: { neighborhood: string | null };
     dropoffAddress: { city: string; postalCode: string };
   };
 };

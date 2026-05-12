@@ -3,12 +3,12 @@ import { ConfigModule } from '@nestjs/config';
 
 import { supabaseConfig } from '@config/supabase.config';
 
-import { AdminKycController } from './kyc/admin-kyc.controller';
-import { AdminKycService } from './kyc/admin-kyc.service';
+import { AdminKycDocumentsController } from './kyc/admin-kyc-documents.controller';
+import { AdminKycDocumentsService } from './kyc/admin-kyc-documents.service';
 
 @Module({
   imports: [ConfigModule.forFeature(supabaseConfig)],
-  controllers: [AdminKycController],
-  providers: [AdminKycService],
+  controllers: [AdminKycDocumentsController],
+  providers: [AdminKycDocumentsService],
 })
 export class AdminModule {}

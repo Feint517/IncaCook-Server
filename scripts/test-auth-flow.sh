@@ -208,7 +208,12 @@ RESPONSE=$(curl -sf -X POST "$BASE_URL/v1/auth/signin" \
   -H "Content-Type: application/json" \
   -d "{\"email\":\"$TEST_EMAIL\",\"password\":\"$PASSWORD_NEW\"}")
 GOOD=$(json_get "$RESPONSE" "['data']['accessToken']")
-TAMPERED="${GOOD%?}X"
+# Replace the last char of the signature; pick a different letter than what's
+# already there so the mangle is always a real change (a sig that ends in 'X'
+# would otherwise be unchanged by a naive `${GOOD%?}X`).
+LAST="${GOOD: -1}"
+if [ "$LAST" = "A" ]; then ALT="B"; else ALT="A"; fi
+TAMPERED="${GOOD%?}$ALT"
 HTTP_CODE=$(curl_status "$BASE_URL/v1/users/me" -H "Authorization: Bearer $TAMPERED")
 [ "$HTTP_CODE" = "401" ] || fail "Expected 401 on tampered JWT, got $HTTP_CODE"
 ok "Tampered token rejected as 401"

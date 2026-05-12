@@ -87,7 +87,10 @@ export class SupabaseJwtStrategy extends PassportStrategy(Strategy, 'jwt') {
     return {
       id: payload.sub,
       email: payload.email,
-      phone: payload.phone,
+      // Supabase emits an empty string when no phone is set; that's a unique
+      // constraint violation waiting to happen since User.phone is @unique.
+      // Normalize empty → undefined so downstream code stores NULL.
+      phone: payload.phone && payload.phone.length > 0 ? payload.phone : undefined,
       role: (payload.role as UserRole) ?? UserRole.Buyer,
     };
   }

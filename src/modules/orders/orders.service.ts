@@ -7,7 +7,7 @@ import {
   NotFoundException,
   ServiceUnavailableException,
 } from '@nestjs/common';
-import { Prisma } from '@prisma/client';
+import { AddressKind, Prisma } from '@prisma/client';
 import type { Address, Order, OrderItem, OrderItemAddOn } from '@prisma/client';
 import type Stripe from 'stripe';
 
@@ -706,6 +706,12 @@ export class OrdersService {
     if (seller.user.deletedAt) {
       throw new BadRequestException('Seller account is unavailable');
     }
+    // Phase A: seller profile fields are nullable until the wizard fills
+    // them in. An order needs at minimum a delivery fee — if it's null, the
+    // seller hasn't finished signup and can't take orders yet.
+    if (seller.deliveryFeeCents === null) {
+      throw new BadRequestException('Seller has not finished profile setup');
+    }
 
     // Per-listing live checks.
     const now = Date.now();
@@ -797,6 +803,8 @@ export class OrdersService {
         data: {
           id,
           userId: buyerId,
+          // An inline drop-off address is always a buyer-side delivery row.
+          kind: AddressKind.BUYER_DELIVERY,
           type: addr.type ?? null,
           customLabel: addr.customLabel ?? null,
           fullAddress: addr.fullAddress,

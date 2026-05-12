@@ -31,6 +31,7 @@ import { SupabaseModule } from '@infrastructure/supabase/supabase.module';
 import { AdminModule } from '@modules/admin/admin.module';
 import { AuthModule } from '@modules/auth/auth.module';
 import { BoostsModule } from '@modules/boosts/boosts.module';
+import { BuyersModule } from '@modules/buyers/buyers.module';
 import { CatalogModule } from '@modules/catalog/catalog.module';
 import { ComplianceModule } from '@modules/compliance/compliance.module';
 import { DeliveriesModule } from '@modules/deliveries/deliveries.module';
@@ -89,6 +90,7 @@ import { WalletsModule } from '@modules/wallets/wallets.module';
     UsersModule,
     SellersModule,
     DriversModule,
+    BuyersModule,
     ListingsModule,
     OrdersModule,
     DeliveriesModule,

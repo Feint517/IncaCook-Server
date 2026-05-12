@@ -1,34 +1,19 @@
-import { Type } from 'class-transformer';
-import {
-  Equals,
-  IsBoolean,
-  IsIn,
-  IsOptional,
-  IsString,
-  MaxLength,
-  MinLength,
-  ValidateNested,
-} from 'class-validator';
+import { Equals, IsBoolean, IsIn, IsString, MaxLength, MinLength } from 'class-validator';
 
 import { UserRole } from '@common/enums/user-role.enum';
-
-import { CreateBuyerProfileDto } from './create-buyer-profile.dto';
-import { CreateDriverProfileDto } from './create-driver-profile.dto';
-import { CreateSellerProfileDto } from './create-seller-profile.dto';
 
 const SIGNUP_ROLES = [UserRole.Buyer, UserRole.Seller, UserRole.Driver] as const;
 type SignupRole = (typeof SIGNUP_ROLES)[number];
 
 /**
- * Body for `POST /v1/users` — completes signup after Supabase Auth has
- * issued a JWT. Identity (email, supabaseId, phone) is read from the JWT;
- * profile + legal-consent fields come from the form.
+ * Body for `POST /v1/users` (Gate 2 of signup, per docs/signup-flow.md).
+ * Identity (email, supabaseId, phone) is read from the JWT.
+ *
+ * This is intentionally minimal — only name, role, and legal consent. The
+ * role-specific data (addresses, KYC, business info, cuisines, vehicle,
+ * etc.) is sent later via per-concept PUT endpoints (Phase B).
  *
  * Admin/Moderator roles are not assignable through this endpoint.
- *
- * Role-specific blocks (`buyerProfile`, `sellerProfile`) are validated
- * structurally here and gated against `role` at the service layer —
- * sending the wrong block for the role is a 400.
  */
 export class CreateUserDto {
   @IsString()
@@ -53,19 +38,4 @@ export class CreateUserDto {
   @IsBoolean()
   @Equals(true, { message: 'Terms of sale (CGV) must be accepted' })
   acceptedCgv!: boolean;
-
-  @IsOptional()
-  @ValidateNested()
-  @Type(() => CreateBuyerProfileDto)
-  buyerProfile?: CreateBuyerProfileDto;
-
-  @IsOptional()
-  @ValidateNested()
-  @Type(() => CreateSellerProfileDto)
-  sellerProfile?: CreateSellerProfileDto;
-
-  @IsOptional()
-  @ValidateNested()
-  @Type(() => CreateDriverProfileDto)
-  driverProfile?: CreateDriverProfileDto;
 }

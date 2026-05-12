@@ -22,7 +22,7 @@ export class DeliveryResponseDto {
   /** What the driver gets paid (entire fulfillment fee, no platform cut). */
   driverPayoutCents!: number;
 
-  pickupNeighborhood!: string;
+  pickupNeighborhood!: string | null;
   dropoffCity!: string;
   dropoffPostalCode!: string;
 
@@ -39,7 +39,7 @@ export class DeliveryResponseDto {
         Order,
         'orderNumber' | 'status' | 'fulfillmentFeeCents'
       > & {
-        seller: { neighborhood: string };
+        seller: { neighborhood: string | null };
         dropoffAddress: { city: string; postalCode: string };
       };
     },

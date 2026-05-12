@@ -120,6 +120,40 @@ enum IdDocumentType {
   TITRE_SEJOUR
 }
 
+// Disambiguates an Address row by role context. Buyer can have several rows
+// of kind BUYER_DELIVERY (saved delivery addresses); seller and driver have
+// at most one (SELLER_PICKUP / DRIVER_HOME) — enforced by partial unique idx
+// added in the migration.
+enum AddressKind {
+  BUYER_DELIVERY
+  SELLER_PICKUP
+  DRIVER_HOME
+}
+
+// Which "slot" a KycDocument fills. Orthogonal to IdDocumentType (carte
+// d'identite vs passeport) — that lives in the row's metadata.
+enum KycDocType {
+  ID_FRONT
+  ID_BACK
+  SELFIE
+  DRIVING_LICENSE
+  CARTE_GRISE
+  INSURANCE
+}
+
+// Versioned legal/charter documents. CGU/CGV are also modeled here so the
+// app can re-prompt on version bumps without an app release. The two
+// booleans on User remain as a fast "did this user accept any version yet"
+// flag, but the source of truth for which version is in UserCharter.
+enum CharterKind {
+  CGU
+  CGV
+  HYGIENE
+  FAIT_MAISON
+  PUNCTUALITY
+  CARE
+}
+
 enum Fulfillment {
   DELIVERY
   PICKUP
@@ -225,8 +259,10 @@ model User {
   auditLogs       AuditLog[]
   idempotencyKeys IdempotencyKey[]
 
-  kycSubmissions     KycSubmission[] @relation("KycAuthor")
-  kycReviewsAuthored KycSubmission[] @relation("KycReviewer")
+  kycDocuments       KycDocument[] @relation("KycAuthor")
+  kycReviewsAuthored KycDocument[] @relation("KycReviewer")
+
+  charters UserCharter[]
 
   reviewsAuthored Review[]   @relation("ReviewAuthor")
   bookmarks       Bookmark[]
@@ -236,55 +272,52 @@ model User {
 }
 
 model SellerProfile {
-  // userId is BOTH the PK and the FK to User.id. Matches BuyerProfile and
-  // BACKEND_SCHEMA.md (`seller_profiles.user_id` PK).
+  // Stub row created at Gate 2 (POST /v1/users with role=SELLER). All
+  // signup fields are nullable: the wizard fills them in via per-concept
+  // PUT endpoints (Phase B). Listing-creation gates check `canList()` (all
+  // required fields present + kycStatus APPROVED) before allowing publish.
   userId String @id
   user   User   @relation(fields: [userId], references: [id])
 
-  category    SellerCategory
-  displayName String
+  category    SellerCategory?
+  displayName String?
   bio         String?
 
-  // Storage object key in `avatars/`. Doc convention: column name uses _url
-  // suffix even though the value is the bucket path. Resolved to a signed
-  // URL at read time.
-  profilePhotoUrl String
+  // Storage object key in `avatars/`. Resolved to a signed URL at read time.
+  profilePhotoUrl String?
 
-  dateOfBirth DateTime @db.Date
+  dateOfBirth DateTime? @db.Date
 
-  // Pickup address — required for sellers. The Address row holds the geo
-  // point; SellerProfile.location below is a denormalized copy for
-  // ST_DWithin queries on the listing feed.
-  pickupAddressId String  @unique
-  pickupAddress   Address @relation("SellerPickupAddress", fields: [pickupAddressId], references: [id])
+  // Pickup address now lives in Address with kind=SELLER_PICKUP. Read by
+  // querying Address WHERE userId=X AND kind='SELLER_PICKUP' (partial
+  // unique idx guarantees at most one row).
 
-  // Required iff category != FAIT_MAISON. Service-layer enforced.
-  businessName String?
-  // 14-digit, Luhn-validated. Required iff category != FAIT_MAISON.
-  siret        String?
+  // Business info — businessName / siret / facadeUrl / openingHours all
+  // moved to SellerBusiness. Fait-maison sellers don't have a business row;
+  // service code derives "skipped" from absence + category.
+  business SellerBusiness?
 
-  // Required iff category = RESTAURANT. Storage key in `seller-facades/`.
-  restaurantFacadeUrl String?
+  // Cuisine + dish selections moved out of array columns into join tables
+  // for indexed lookups in the buyer feed.
+  cuisines SellerCuisine[]
+  dishes   SellerDish[]
 
-  cuisineTypes CuisineType[] @default([])
-  dishTypes    DishType[]    @default([])
+  hygieneCommitment    Boolean? // null = not yet accepted
+  faitMaisonCommitment Boolean?
 
-  hygieneCommitment    Boolean @default(false)
-  faitMaisonCommitment Boolean @default(false)
-
-  // Service area + economics.
-  deliveryRadiusKm Decimal @db.Decimal(4, 1)
-  deliveryFeeCents Int
+  // Service area + economics. Filled via PUT /v1/sellers/me/profile.
+  deliveryRadiusKm Decimal? @db.Decimal(4, 1)
+  deliveryFeeCents Int?
 
   // Prep window (minutes). prepMaxMinutes >= prepMinMinutes (service-layer).
-  prepMinMinutes Int
-  prepMaxMinutes Int
+  prepMinMinutes Int?
+  prepMaxMinutes Int?
 
-  neighborhood  String
+  neighborhood  String?
   languageCodes String[] @default([]) // ISO codes
 
   // Free-text human-readable schedule. Structured opening hours live in
-  // SellerOpeningHours (restaurants only).
+  // SellerOpeningHours under SellerBusiness (non-fait-maison only).
   availabilitySchedule String?
 
   // Internal badge keys ("verified", "top-seller", etc.).
@@ -293,9 +326,9 @@ model SellerProfile {
   promoText   String?
   categoryTag String?
 
-  // Denormalized from pickupAddress.point for radius queries on the listing
-  // feed. Written via raw SQL inside the same transaction as Address insert.
-  // GIST-indexed in the migration.
+  // Denormalized from the pickup Address.point for radius queries on the
+  // listing feed. Written via raw SQL when the seller PUTs their pickup
+  // address. GIST-indexed in the migration.
   location Unsupported("geography(Point, 4326)")?
 
   // INSERT trigger sets this to APPROVED for FAIT_MAISON (no admin review).
@@ -304,53 +337,51 @@ model SellerProfile {
   kycStatus KycStatus @default(PENDING)
 
   // Stripe Express Connect account for receiving payouts. Created via
-  // Stripe Connect onboarding (separate slice). Onboarding completion is
-  // flipped by the `account.updated` webhook when charges_enabled,
-  // payouts_enabled, and details_submitted are all true.
+  // Stripe Connect onboarding. Onboarding completion is flipped by the
+  // `account.updated` webhook when charges_enabled, payouts_enabled, and
+  // details_submitted are all true.
   stripeConnectAccountId    String? @unique
   stripeOnboardingCompleted Boolean @default(false)
 
   isPremium     Boolean @default(false) // 25% commission tier vs 30%
   totalOrders   Int     @default(0)
-  // Denormalized aggregates over Review rows. Recomputed inside the same
-  // transaction that inserts a new review, so the buyer feed can sort by
-  // rating without joining the reviews table on every query.
   averageRating Float?
   reviewCount   Int     @default(0)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  listings     Listing[]
-  orders       Order[]              @relation("SellerOrders")
-  openingHours SellerOpeningHours[]
-  reviews      Review[]             @relation("SellerReviews")
+  listings Listing[]
+  orders   Order[]   @relation("SellerOrders")
+  reviews  Review[]  @relation("SellerReviews")
 
   @@index([category])
   @@index([kycStatus])
 }
 
 model DriverProfile {
-  // userId is BOTH the PK and the FK to User.id. Matches BACKEND_SCHEMA.md
-  // (`driver_profiles.user_id` PK).
+  // Stub row created at Gate 2 (POST /v1/users with role=DRIVER). All
+  // signup fields are nullable: the wizard fills them in via per-concept
+  // PUT endpoints (Phase B). Delivery-assignment gates check `canDeliver()`
+  // (required fields + KYC APPROVED + Stripe onboarded) before matching.
   userId String @id
   user   User   @relation(fields: [userId], references: [id])
 
-  dateOfBirth DateTime @db.Date
+  dateOfBirth DateTime? @db.Date
 
-  // Base address — where the driver typically operates from. Required.
-  baseAddressId String  @unique
-  baseAddress   Address @relation("DriverBaseAddress", fields: [baseAddressId], references: [id])
+  // Base address now lives in Address with kind=DRIVER_HOME. Read by
+  // querying Address WHERE userId=X AND kind='DRIVER_HOME' (partial unique
+  // idx guarantees at most one row).
 
-  vehicleType DriverVehicleType
+  vehicleType DriverVehicleType?
 
-  // Free-text neighborhood names. Doc flags this as a future FK to a
-  // `zones` lookup table; for now an array of strings.
-  operatingZones String[] @default([])
+  // Driver zones moved out of array column into a join table — same
+  // motivation as SellerCuisine.
+  zones DriverZone[]
 
-  charterAccepted       Boolean @default(false)
-  punctualityCommitment Boolean @default(false)
-  careCommitment        Boolean @default(false)
+  charterAccepted       Boolean? // null = not yet accepted
+  punctualityCommitment Boolean?
+  careCommitment        Boolean?
 
   kycStatus KycStatus @default(PENDING)
 
@@ -379,11 +410,11 @@ model DriverProfile {
 }
 
 model BuyerProfile {
+  // Default delivery address moved to Address with kind=BUYER_DELIVERY.
+  // Multiple rows per user allowed (HOME / WORK / OTHER via Address.type);
+  // app-level convention: the most-recently-updated row is "default".
   userId String @id
   user   User   @relation(fields: [userId], references: [id])
-
-  defaultAddressId String?
-  defaultAddress   Address? @relation("BuyerDefaultAddress", fields: [defaultAddressId], references: [id])
 
   // Postgres enum arrays. Default to empty rather than NULL so reads never
   // need a null-check.
@@ -398,6 +429,12 @@ model Address {
   id     String @id
   userId String
   user   User   @relation(fields: [userId], references: [id])
+
+  // Role-context kind. Replaces the old per-role FKs on profile tables.
+  // Buyer can have several BUYER_DELIVERY rows; seller and driver each
+  // have at most one (SELLER_PICKUP / DRIVER_HOME) — enforced by partial
+  // unique idx added in the migration.
+  kind AddressKind
 
   type        SavedAddressType?
   customLabel String?
@@ -419,19 +456,111 @@ model Address {
   createdAt DateTime  @default(now())
   updatedAt DateTime  @updatedAt
 
-  buyersWithDefault  BuyerProfile[]  @relation("BuyerDefaultAddress")
-  sellersUsingPickup SellerProfile[] @relation("SellerPickupAddress")
-  driversUsingBase   DriverProfile[] @relation("DriverBaseAddress")
-  ordersWithDropoff  Order[]         @relation("OrderDropoff")
+  ordersWithDropoff Order[] @relation("OrderDropoff")
 
   @@index([userId])
+  @@index([userId, kind])
   @@index([deletedAt])
 }
 
+model SellerBusiness {
+  // 1:1 with SellerProfile, but only present for non-fait-maison sellers.
+  // Holds the legally-required business identity (SIRET, business name,
+  // facade) plus the weekly opening hours.
+  userId String        @id
+  seller SellerProfile @relation(fields: [userId], references: [userId], onDelete: Cascade)
+
+  businessName String
+  // 14-digit, Luhn-validated. Unique across the platform.
+  siret        String  @unique
+  // Storage key in `seller-facades/`. Resolved to a signed URL at read time.
+  facadeUrl    String?
+  legalForm    String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  openingHours SellerOpeningHours[]
+}
+
+model SellerCuisine {
+  // Indexed join — buyer feed filters by cuisine, so an exact-match index
+  // beats Postgres array containment for selectivity.
+  userId      String
+  cuisineType CuisineType
+  seller      SellerProfile @relation(fields: [userId], references: [userId], onDelete: Cascade)
+
+  @@id([userId, cuisineType])
+  @@index([cuisineType])
+}
+
+model SellerDish {
+  userId   String
+  dishType DishType
+  seller   SellerProfile @relation(fields: [userId], references: [userId], onDelete: Cascade)
+
+  @@id([userId, dishType])
+  @@index([dishType])
+}
+
+model DriverZone {
+  // Free-text zone identifiers ("Bastille", "Marais", etc.). Future v2 will
+  // promote these to a `Zone` lookup with a polygon geography column.
+  userId String
+  zoneId String
+  driver DriverProfile @relation(fields: [userId], references: [userId], onDelete: Cascade)
+
+  @@id([userId, zoneId])
+  @@index([zoneId])
+}
+
+model UserCharter {
+  // Versioned acceptance record. Each new version a user accepts is a new
+  // row — keeps the audit trail of which version was current when they
+  // agreed. PK on (userId, charter, version) so re-prompting on a version
+  // bump appends rather than overwrites.
+  userId     String
+  charter    CharterKind
+  version    String
+  acceptedAt DateTime    @default(now())
+  user       User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([userId, charter, version])
+  @@index([userId, charter, acceptedAt(sort: Desc)])
+}
+
+model KycDocument {
+  // One row per uploaded document. Unique on (userId, type): a new upload
+  // for the same slot supersedes the previous (older fileUrl is overwritten
+  // — we don't keep KYC history beyond what storage retains).
+  id              String     @id
+  userId          String
+  user            User       @relation("KycAuthor", fields: [userId], references: [id], onDelete: Cascade)
+  type            KycDocType
+  // Storage key in `kyc/`. Resolved to a signed URL at read time.
+  fileUrl         String
+  reviewState     KycStatus  @default(PENDING)
+  reviewerId      String?
+  reviewer        User?      @relation("KycReviewer", fields: [reviewerId], references: [id])
+  reviewedAt      DateTime?
+  rejectionReason String?
+  // Stashes per-slot metadata that doesn't warrant a column. Today: the
+  // IdDocumentType (CARTE_IDENTITE / PASSEPORT / TITRE_SEJOUR) on ID_FRONT
+  // / ID_BACK rows so admins know what they're reviewing.
+  metadata        Json?
+  submittedAt     DateTime   @default(now())
+
+  @@unique([userId, type])
+  @@index([reviewState, submittedAt])
+  @@index([userId])
+}
+
 model SellerOpeningHours {
-  // 1:N with SellerProfile, restaurants only (service-layer enforced).
+  // 1:N with SellerBusiness — only sellers that have a business row (i.e.
+  // non-fait-maison) have opening hours. Fait-maison sellers operate on
+  // their listings' explicit pickup windows.
   sellerId String
-  seller   SellerProfile @relation(fields: [sellerId], references: [userId], onDelete: Cascade)
+  seller   SellerBusiness @relation(fields: [sellerId], references: [userId], onDelete: Cascade)
 
   dayOfWeek DayOfWeek
   // Local time, no zone — the seller's local opening time.
@@ -439,45 +568,6 @@ model SellerOpeningHours {
   endTime   DateTime  @db.Time()
 
   @@id([sellerId, dayOfWeek])
-}
-
-model KycSubmission {
-  id     String @id
-  // The user submitting the documents. Resolved from the JWT — never
-  // accepted from the request body.
-  userId String
-  user   User   @relation("KycAuthor", fields: [userId], references: [id])
-
-  idDocumentType IdDocumentType
-
-  // All `*Url` columns hold Supabase Storage object keys in the `kyc/`
-  // bucket (e.g. `kyc/<supabase_user_id>/id-front.jpg`). Resolved to a
-  // signed URL at read time. The bucket is private; RLS restricts access
-  // to the owner + reviewers.
-  idFrontUrl String
-  idBackUrl  String?
-  selfieUrl  String
-
-  // Driver-specific fields (motorized vehicles only). Always null for
-  // sellers. Wired up when driver signup ships.
-  drivingLicenseUrl String?
-  carteGriseUrl     String?
-  insuranceUrl      String?
-
-  // Status starts at PENDING; admin review flips to APPROVED or REJECTED.
-  // The seller's SellerProfile.kycStatus mirrors the latest submission's
-  // status.
-  status KycStatus @default(PENDING)
-
-  reviewerId      String?
-  reviewer        User?     @relation("KycReviewer", fields: [reviewerId], references: [id])
-  reviewedAt      DateTime?
-  rejectionReason String?
-
-  submittedAt DateTime @default(now())
-
-  @@index([userId, submittedAt(sort: Desc)])
-  @@index([status])
 }
 
 // -------- Catalog --------

@@ -4,7 +4,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { Prisma } from '@prisma/client';
+import { AddressKind, Prisma } from '@prisma/client';
 import type { Listing, ListingAddOn } from '@prisma/client';
 
 import { UserRole } from '@common/enums/user-role.enum';
@@ -90,9 +90,21 @@ export class ListingsService {
     if (!seller) {
       throw new ForbiddenException('Only sellers can manage listings');
     }
+    // Phase A: seller profile rows are stubs until the wizard fills them
+    // in. Listings need at minimum a category (denormalized onto Listing
+    // for filtering). Phase C's onboarding endpoint will surface a richer
+    // "canList" check; for now we just gate on category presence.
+    if (!seller.category) {
+      throw new ForbiddenException(
+        'Complete your seller profile before creating listings',
+      );
+    }
 
     validateListingShape(dto);
     const expiresAt = parseFutureDate(dto.expiresAt, 'expiresAt');
+    // Capture across the transaction-closure boundary so the non-null
+    // narrowing from the guard above is preserved.
+    const category = seller.category;
 
     const id = generateUlid();
     return this.prisma.$transaction(async (tx) => {
@@ -101,7 +113,7 @@ export class ListingsService {
           id,
           sellerId,
           // category is server-set from the seller's profile (denormalized).
-          category: seller.category,
+          category,
           name: dto.name,
           description: dto.description ?? null,
           imageUrls: dto.imageUrls,
@@ -399,12 +411,18 @@ export class ListingsService {
       return { lat: query.lat, lng: query.lng };
     }
 
-    const user = await this.prisma.db.user.findUnique({
-      where: { supabaseId },
-      include: { buyerProfile: { include: { defaultAddress: true } } },
+    const user = await this.prisma.db.user.findUnique({ where: { supabaseId } });
+    if (!user) {
+      return null;
+    }
+    // Buyer's default delivery address is now an Address row with
+    // kind=BUYER_DELIVERY. Multiple may exist; most-recently-updated wins.
+    const address = await this.prisma.db.address.findFirst({
+      where: { userId: user.id, kind: AddressKind.BUYER_DELIVERY, deletedAt: null },
+      orderBy: { updatedAt: 'desc' },
+      select: { id: true },
     });
-    const addressId = user?.buyerProfile?.defaultAddress?.id;
-    if (!addressId) {
+    if (!address) {
       return null;
     }
 
@@ -413,7 +431,7 @@ export class ListingsService {
         ST_Y("point"::geometry)::float8 AS "lat",
         ST_X("point"::geometry)::float8 AS "lng"
       FROM "Address"
-      WHERE id = ${addressId} AND "point" IS NOT NULL
+      WHERE id = ${address.id} AND "point" IS NOT NULL
     `;
     return rows[0] ?? null;
   }

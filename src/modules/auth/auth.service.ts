@@ -3,13 +3,18 @@ import {
   ConflictException,
   HttpException,
   HttpStatus,
+  Inject,
   Injectable,
   InternalServerErrorException,
   Logger,
   UnauthorizedException,
 } from '@nestjs/common';
+import type { ConfigType } from '@nestjs/config';
 import type { AuthError, Session, User } from '@supabase/supabase-js';
 
+import { supabaseConfig } from '@config/supabase.config';
+
+import { PrismaService } from '@infrastructure/database/prisma.service';
 import { SupabaseAdminService } from '@infrastructure/supabase/supabase-admin.service';
 import { SupabaseService } from '@infrastructure/supabase/supabase.service';
 
@@ -35,6 +40,9 @@ export class AuthService {
   constructor(
     private readonly anon: SupabaseService,
     private readonly admin: SupabaseAdminService,
+    private readonly prisma: PrismaService,
+    @Inject(supabaseConfig.KEY)
+    private readonly cfg: ConfigType<typeof supabaseConfig>,
   ) {}
 
   async signUp(email: string, password: string): Promise<SessionResponseDto> {
@@ -115,6 +123,100 @@ export class AuthService {
     }
   }
 
+  /**
+   * Attaches a phone number to the authenticated user and triggers an OTP
+   * send. Calling again with a different phone overwrites the pending
+   * phone (Supabase last-write-wins on phone_change_token). The supabase-js
+   * SDK doesn't expose a user-context update without juggling sessions on
+   * a stateless backend, so we hit the REST API directly with the user's
+   * own Bearer token.
+   */
+  async requestPhoneOtp(accessToken: string, phone: string): Promise<void> {
+    const response = await fetch(`${this.cfg.url}/auth/v1/user`, {
+      method: 'PUT',
+      headers: {
+        apikey: this.cfg.anonKey,
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ phone }),
+    });
+    if (!response.ok) {
+      const body = await readErrorBody(response);
+      throw this.mapSupabaseHttpError(response.status, body, 'phone OTP request failed');
+    }
+  }
+
+  /**
+   * Confirms the OTP, marking the phone as verified on Supabase's
+   * auth.users and mirroring the value onto our User table.
+   *
+   * Supabase's verify returns a fresh session (the user's `aal` may bump
+   * after MFA verify), so we surface it — the client can swap tokens to
+   * keep `phoneConfirmedAt` up-to-date in subsequent /me reads.
+   */
+  async verifyPhoneOtp(
+    accessToken: string,
+    phone: string,
+    code: string,
+  ): Promise<SessionResponseDto> {
+    const response = await fetch(`${this.cfg.url}/auth/v1/verify`, {
+      method: 'POST',
+      headers: {
+        apikey: this.cfg.anonKey,
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ phone, token: code, type: 'phone_change' }),
+    });
+    if (!response.ok) {
+      const body = await readErrorBody(response);
+      throw this.mapSupabaseHttpError(response.status, body, 'phone OTP verify failed');
+    }
+
+    const raw = (await response.json()) as {
+      access_token: string;
+      refresh_token: string;
+      expires_at?: number;
+      user: {
+        id: string;
+        email: string | null;
+        phone: string | null;
+        email_confirmed_at: string | null;
+        phone_confirmed_at: string | null;
+      };
+    };
+
+    // Supabase stores phone in stripped form (no leading `+`); we store
+    // canonical E.164 so clients can display it without further transforms.
+    const canonicalPhone = raw.user.phone
+      ? raw.user.phone.startsWith('+')
+        ? raw.user.phone
+        : `+${raw.user.phone}`
+      : null;
+
+    await this.prisma.db.user.update({
+      where: { supabaseId: raw.user.id },
+      data: {
+        phone: canonicalPhone,
+        phoneVerified: raw.user.phone_confirmed_at !== null,
+      },
+    });
+
+    return {
+      accessToken: raw.access_token,
+      refreshToken: raw.refresh_token,
+      expiresAt: raw.expires_at ?? 0,
+      user: {
+        id: raw.user.id,
+        email: raw.user.email,
+        phone: canonicalPhone,
+        emailConfirmedAt: raw.user.email_confirmed_at,
+        phoneConfirmedAt: raw.user.phone_confirmed_at,
+      },
+    };
+  }
+
   // -------------------- internals --------------------
 
   private toSession(session: Session): SessionResponseDto {
@@ -153,5 +255,44 @@ export class AuthService {
     }
     this.logger.error(`Supabase auth ${fallback}: ${error.message} (code=${code} status=${status})`);
     return new InternalServerErrorException('Authentication service error');
+  }
+
+  /**
+   * Like `toHttpException` but for raw REST responses (used for phone OTP,
+   * where we hit /auth/v1/user and /auth/v1/verify directly).
+   */
+  private mapSupabaseHttpError(
+    status: number,
+    body: { error_code?: string; msg?: string; message?: string; error?: string },
+    fallback: string,
+  ): HttpException {
+    const code = body.error_code ?? body.error ?? '';
+    const message = body.msg ?? body.message ?? body.error ?? 'Unknown error';
+    if (status === 401 || code === 'otp_expired' || code === 'invalid_otp') {
+      return new UnauthorizedException(message);
+    }
+    if (status === 422 || code === 'phone_provider_disabled') {
+      return new BadRequestException(message);
+    }
+    if (status === 429) {
+      return new HttpException(message, HttpStatus.TOO_MANY_REQUESTS);
+    }
+    if (status >= 400 && status < 500) {
+      return new BadRequestException(message);
+    }
+    this.logger.error(`Supabase ${fallback}: status=${status} code=${code} msg=${message}`);
+    return new InternalServerErrorException('Authentication service error');
+  }
+}
+
+async function readErrorBody(
+  response: Response,
+): Promise<{ error_code?: string; msg?: string; message?: string; error?: string }> {
+  try {
+    return (await response.json()) as ReturnType<typeof readErrorBody> extends Promise<infer T>
+      ? T
+      : never;
+  } catch {
+    return { message: response.statusText };
   }
 }

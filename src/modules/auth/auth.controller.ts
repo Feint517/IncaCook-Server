@@ -16,10 +16,12 @@ import type { AuthenticatedUser } from '@common/types/authenticated-request.type
 import { AuthService } from './auth.service';
 import { RefreshSessionDto } from './dto/refresh-session.dto';
 import { RequestPasswordResetDto } from './dto/request-password-reset.dto';
+import { RequestPhoneOtpDto } from './dto/request-phone-otp.dto';
 import { SessionResponseDto } from './dto/session-response.dto';
 import { SignInDto } from './dto/sign-in.dto';
 import { SignUpDto } from './dto/sign-up.dto';
 import { UpdatePasswordDto } from './dto/update-password.dto';
+import { VerifyPhoneOtpDto } from './dto/verify-phone-otp.dto';
 
 @Controller({ path: 'auth', version: '1' })
 export class AuthController {
@@ -82,6 +84,36 @@ export class AuthController {
     @Body() dto: UpdatePasswordDto,
   ): Promise<void> {
     return this.auth.updatePassword(jwtUser.id, dto.newPassword);
+  }
+
+  /**
+   * Attaches a phone to the caller's existing email-based account and
+   * triggers an SMS OTP (or the local test_otp map). Idempotent —
+   * calling again with the same phone re-sends; calling with a different
+   * phone overwrites the pending one.
+   */
+  @Post('phone/request-otp')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  async requestPhoneOtp(
+    @Headers('authorization') authHeader: string | undefined,
+    @Body() dto: RequestPhoneOtpDto,
+  ): Promise<void> {
+    const token = extractBearer(authHeader);
+    await this.auth.requestPhoneOtp(token, dto.phone);
+  }
+
+  /**
+   * Confirms the OTP. On success the user's phone is marked verified
+   * (both on Supabase and on our User row). Returns a fresh session.
+   */
+  @Post('phone/verify')
+  @HttpCode(HttpStatus.OK)
+  verifyPhoneOtp(
+    @Headers('authorization') authHeader: string | undefined,
+    @Body() dto: VerifyPhoneOtpDto,
+  ): Promise<SessionResponseDto> {
+    const token = extractBearer(authHeader);
+    return this.auth.verifyPhoneOtp(token, dto.phone, dto.code);
   }
 }
 

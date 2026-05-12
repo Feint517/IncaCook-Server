@@ -5,10 +5,16 @@ import { DietaryTag } from '@common/enums/dietary-tag.enum';
 
 import { AddressResponseDto } from './address-response.dto';
 
+/**
+ * Buyer slice of /v1/users/me. Field names match the request body of
+ * `PUT /v1/buyers/me/preferences` (dietaryTags / allergens) — the schema's
+ * older column names (dietaryPreferences / allergies) are an internal
+ * implementation detail and aren't exposed on the wire.
+ */
 export class BuyerProfileResponseDto {
   defaultAddress!: AddressResponseDto | null;
-  dietaryPreferences!: DietaryTag[];
-  allergies!: Allergen[];
+  dietaryTags!: DietaryTag[];
+  allergens!: Allergen[];
 
   static from(
     profile: BuyerProfile,
@@ -16,8 +22,8 @@ export class BuyerProfileResponseDto {
   ): BuyerProfileResponseDto {
     return {
       defaultAddress,
-      dietaryPreferences: profile.dietaryPreferences as DietaryTag[],
-      allergies: profile.allergies as Allergen[],
+      dietaryTags: profile.dietaryPreferences as DietaryTag[],
+      allergens: profile.allergies as Allergen[],
     };
   }
 }
