@@ -71,6 +71,36 @@ export class AuthService {
     return this.toSession(data.session);
   }
 
+  /**
+   * Mobile-native Google Sign-In. The Flutter app obtains the ID token
+   * via the `google_sign_in` plugin and forwards it here; we hand it to
+   * Supabase's `signInWithIdToken`, which verifies the JWT signature
+   * against Google's JWKS, checks the `aud` against the configured Web
+   * client ID (see [auth.external.google] in supabase/config.toml), and
+   * returns a Supabase session. If the email already exists as an
+   * email-password user, Supabase auto-links the new identity to the
+   * existing auth.users row (Google always returns `email_verified=true`,
+   * and our email-password signups auto-confirm).
+   *
+   * First-time Google users land here with a session but **no** User row
+   * yet — the Flutter wizard still POSTs `/v1/users` (Gate 2) afterwards
+   * to commit role + name + CGU, just like email signup.
+   */
+  async signInWithGoogle(idToken: string, nonce?: string): Promise<SessionResponseDto> {
+    const { data, error } = await this.anon.client.auth.signInWithIdToken({
+      provider: 'google',
+      token: idToken,
+      ...(nonce ? { nonce } : {}),
+    });
+    if (error || !data.session) {
+      throw this.toHttpException(
+        error ?? ({ message: 'Google sign-in failed', status: 401 } as AuthError),
+        'google sign-in failed',
+      );
+    }
+    return this.toSession(data.session);
+  }
+
   async refresh(refreshToken: string): Promise<SessionResponseDto> {
     const { data, error } = await this.anon.client.auth.refreshSession({
       refresh_token: refreshToken,

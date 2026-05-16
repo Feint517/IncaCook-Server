@@ -14,6 +14,7 @@ import { Public } from '@common/decorators/public.decorator';
 import type { AuthenticatedUser } from '@common/types/authenticated-request.type';
 
 import { AuthService } from './auth.service';
+import { GoogleSignInDto } from './dto/google-sign-in.dto';
 import { RefreshSessionDto } from './dto/refresh-session.dto';
 import { RequestPasswordResetDto } from './dto/request-password-reset.dto';
 import { RequestPhoneOtpDto } from './dto/request-phone-otp.dto';
@@ -41,6 +42,20 @@ export class AuthController {
   @HttpCode(HttpStatus.OK)
   signIn(@Body() dto: SignInDto): Promise<SessionResponseDto> {
     return this.auth.signIn(dto.email, dto.password);
+  }
+
+  /**
+   * Mobile-native Google Sign-In. App POSTs the Google ID token (from
+   * the `google_sign_in` plugin) and receives the same `SessionResponse`
+   * shape as email signup. On a first-time Google user the wizard must
+   * still POST `/v1/users` afterwards (Gate 2) — Google gives us the
+   * identity, not the role.
+   */
+  @Public()
+  @Post('google')
+  @HttpCode(HttpStatus.OK)
+  google(@Body() dto: GoogleSignInDto): Promise<SessionResponseDto> {
+    return this.auth.signInWithGoogle(dto.idToken, dto.nonce);
   }
 
   @Public()

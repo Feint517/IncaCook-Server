@@ -163,6 +163,7 @@ All under `/v1/auth/*`. Public endpoints don't need an `Authorization` header.
 |---|---|---|---|---|
 | `POST /auth/signup` | public | `{ email, password }` | session | 201 |
 | `POST /auth/signin` | public | `{ email, password }` | session | 200 |
+| `POST /auth/google` | public | `{ idToken, nonce? }` | session | 200 |
 | `POST /auth/refresh` | public (refreshToken in body) | `{ refreshToken }` | session | 200 |
 | `POST /auth/signout?scope=local\|global` | Bearer | — | — | 204 |
 | `POST /auth/password/reset-request` | public | `{ email, redirectTo? }` | — | 204 |
@@ -288,6 +289,102 @@ class AuthInterceptor extends Interceptor {
   }
 }
 ```
+
+### Google Sign-In
+
+The app talks to Google **only through the native plugin** — no HTTP
+calls to Google from Dart. The plugin returns a Google ID token; we
+forward it to `POST /v1/auth/google` and get back the same
+`SessionResponse` shape as email signup.
+
+#### Client IDs
+
+| Where | Client ID type | Used for |
+|---|---|---|
+| `ios/Runner/Info.plist` (`GIDClientID`) | iOS | Native account picker on iOS; also the `aud` of the iOS ID token |
+| Android — auto-detected from package + SHA-1 | Android | Native account picker on Android; also the `aud` of the Android ID token |
+| `serverClientId` on `GoogleSignIn` | Web | Requests an offline-access `serverAuthCode`; on Android also sets the ID token `aud` (but **not** on iOS) |
+
+> **iOS quirk.** Per Google's iOS SDK 8.x, the iOS ID token's `aud` is
+> **always** the iOS OAuth client — `serverClientId` only governs the
+> `serverAuthCode`, not the ID token audience. Android behaves
+> differently: there `serverClientId` does become the `aud`. Our
+> backend handles the asymmetry by accepting **all three** client IDs
+> as valid audiences in Supabase (see
+> [`supabase/config.toml`](../supabase/config.toml) `[auth.external.google]`
+> + `SUPABASE_AUTH_EXTERNAL_GOOGLE_CLIENT_ID` in `.env.test`, which
+> takes a comma-separated list). The Flutter app doesn't need to do
+> anything platform-specific — just sign in and forward the ID token.
+
+#### `pubspec.yaml`
+
+```yaml
+dependencies:
+  google_sign_in: ^6.2.1
+```
+
+#### iOS setup
+
+In `ios/Runner/Info.plist`, add:
+
+```xml
+<key>GIDClientID</key>
+<string>850527183709-vqsisaq8u8825lmfkd337l10lplqlalf.apps.googleusercontent.com</string>
+<key>CFBundleURLTypes</key>
+<array>
+  <dict>
+    <key>CFBundleURLSchemes</key>
+    <array>
+      <!-- The "REVERSED_CLIENT_ID" from the iOS GoogleService-Info.plist -->
+      <string>com.googleusercontent.apps.850527183709-vqsisaq8u8825lmfkd337l10lplqlalf</string>
+    </array>
+  </dict>
+</array>
+```
+
+Bundle ID is `com.progix.incacook`.
+
+#### Android setup
+
+No manifest changes. Android infers the OAuth client from the package
+name + signing SHA-1; make sure both are registered in the Google Cloud
+Android client. For debug builds, register the debug keystore SHA-1
+too (`./gradlew signingReport`).
+
+#### Dart usage
+
+```dart
+import 'package:google_sign_in/google_sign_in.dart';
+
+// No platform-specific config needed — iOS picks up GIDClientID from
+// Info.plist, Android picks up its OAuth client from package + SHA-1.
+// The backend accepts iOS / Android / Web `aud` values equally.
+final _googleSignIn = GoogleSignIn(scopes: ['email', 'profile']);
+
+Future<Session> signInWithGoogle() async {
+  final account = await _googleSignIn.signIn();
+  if (account == null) throw Exception('User cancelled');
+  final auth = await account.authentication;
+  final idToken = auth.idToken;
+  if (idToken == null) throw Exception('No ID token returned by Google');
+
+  final resp = await dio.post(
+    '/v1/auth/google',
+    data: {'idToken': idToken},
+  );
+  return Session.fromJson(resp.data['data']);
+}
+```
+
+After this returns, the flow is identical to email signup:
+- **First-time Google user** → no `User` row yet; the wizard sends the
+  user to the role-selection screen and POSTs `/v1/users` (Gate 2).
+- **Returning Google user** → `GET /v1/users/me/onboarding` decides
+  whether to drop them at the home screen or resume an unfinished
+  wizard step.
+- **Email-password user with the same Google email** → Supabase
+  auto-links the Google identity to the existing `auth.users` row; the
+  user lands on their existing `User` row with their existing role.
 
 ### Password reset deep link
 

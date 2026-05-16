@@ -179,6 +179,65 @@ Error cases:
 - `400` — password too weak (`error.code` lives on the wire)
 - `429` — over rate limit
 
+### 3.1a `POST /v1/auth/google` — public
+
+Mobile-native Google Sign-In. The Flutter app uses the
+[`google_sign_in`](https://pub.dev/packages/google_sign_in) plugin to
+get a Google **ID token** from the OS-level account picker, then POSTs
+that token here. The backend exchanges it for a Supabase session via
+`signInWithIdToken`; the app never talks to Google over HTTP.
+
+```http
+POST /v1/auth/google                  Auth: public    Status: 200
+```
+```jsonc
+// request
+{
+  "idToken": "eyJhbGciOiJSUzI1NiIs...",   // from google_sign_in
+  "nonce": "raw-nonce-here"               // optional; only if the app
+                                          // generated a hashed nonce
+                                          // and embedded it in the ID
+                                          // token request
+}
+```
+
+Response: same `SessionResponse` as §3.1 (`accessToken`, `refreshToken`,
+`expiresAt`, `user`).
+
+Behavior:
+- **First sign-in for this Google account** — Supabase creates the
+  `auth.users` row with the Google identity attached. No `User` row in
+  our DB yet — the wizard must POST §3.3 (`POST /v1/users`) afterwards
+  to commit role + name + CGU, just like email signup.
+- **Existing email-password user with the same email** — Supabase
+  auto-links the Google identity to the existing `auth.users` row.
+  Subsequent Google sign-ins return that same user. Our `User` row is
+  reused; the user keeps their existing role / profile / data.
+- **Existing Google user signing in again** — returns a fresh session
+  for the existing row.
+
+Error cases:
+- `400` — `Bad ID token` (signature invalid, expired, or `aud` doesn't
+  match one of our configured client IDs).
+- `400` — `Unacceptable audience in id_token: [...]` — the `aud` in
+  the token isn't in `SUPABASE_AUTH_EXTERNAL_GOOGLE_CLIENT_ID`. Add
+  the offending client ID to the comma-separated list and restart
+  Supabase. (This is normal the first time a new platform's OAuth
+  client gets added.)
+- `401` — token is well-formed but Google can no longer verify it
+  (revoked, account disabled).
+- `429` — rate-limited by Supabase.
+
+> The Google provider is enabled in
+> [`supabase/config.toml`](../supabase/config.toml)
+> `[auth.external.google]`. `SUPABASE_AUTH_EXTERNAL_GOOGLE_CLIENT_ID`
+> is a **comma-separated** list of allowed `aud` values — we list the
+> Web + iOS + Android OAuth client IDs because each platform mints
+> tokens with its own `aud` (iOS Google SDK 8.x keeps `aud` = iOS
+> client even when `serverClientId` is set; Android uses `serverClientId`;
+> Web is for future server-side OAuth flows). Secrets live in `.env.test`
+> locally — never commit them.
+
 ### 3.2 `POST /v1/auth/signin` — public
 
 Email + password. Same response shape as `/signup`. Wrong credentials
@@ -919,6 +978,9 @@ End-to-end sequence the backend observes for a complete signup:
 
 ```
 1.  POST  /v1/auth/signup                          → row in auth.users (session returned)
+    │
+    └── Google path (same Gate 1 effect):
+        POST /v1/auth/google                       → row in auth.users (Google identity)
 2.  POST  /v1/users                                → row in User (Gate 2, role committed)
 3.  POST  /v1/auth/phone/request-otp               → Supabase sends SMS OTP
 4.  POST  /v1/auth/phone/verify                    → User.phone, User.phoneVerified set

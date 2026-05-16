@@ -333,6 +333,29 @@ skip_nonce_check = false
 # If enabled, it will allow the user to successfully authenticate when the provider does not return an email address.
 email_optional = false
 
+# Google sign-in via ID-token flow (mobile native plugin). The app talks to
+# `POST /v1/auth/google` with the ID token; the backend exchanges it for a
+# Supabase session via `signInWithIdToken`.
+#
+# `client_id` is a comma-separated list of allowed `aud` values. Supabase
+# accepts any ID token whose `aud` matches one of these. We list all three
+# OAuth clients because each platform mints a token with its own `aud`:
+#   - Web: canonical / used by future server-side OAuth code-exchange
+#   - iOS: iOS Google SDK 8.x keeps `aud` = iOS client ID by design
+#          (`serverClientId` on iOS only governs `serverAuthCode`)
+#   - Android: native sign-in mints `aud` = Android client ID
+# Keep Web first so it stays the "primary" identity for non-mobile flows.
+[auth.external.google]
+enabled = true
+client_id = "env(SUPABASE_AUTH_EXTERNAL_GOOGLE_CLIENT_ID)"
+secret = "env(SUPABASE_AUTH_EXTERNAL_GOOGLE_SECRET)"
+redirect_uri = ""
+url = ""
+# Native Google Sign-In on iOS doesn't always include a nonce in the ID
+# token. Skipping the nonce check is the standard recommendation for
+# `signInWithIdToken` + Google on mobile.
+skip_nonce_check = true
+
 # Allow Solana wallet holders to sign in to your project via the Sign in with Solana (SIWS, EIP-4361) standard.
 # You can configure "web3" rate limit in the [auth.rate_limit] section and set up [auth.captcha] if self-hosting.
 [auth.web3.solana]
