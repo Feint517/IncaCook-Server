@@ -15,18 +15,24 @@ For deeper specifications:
 
 | Environment | Base URL | Notes |
 |---|---|---|
-| Local — iOS simulator | `http://127.0.0.1:3000` | Simulator shares host loopback |
-| Local — Android emulator | `http://10.0.2.2:3000` | Emulator-only alias for host loopback |
-| Local — physical device on Wi-Fi | `http://<your-LAN-IP>:3000` | e.g. `http://192.168.1.42:3000` |
+| Local — iOS simulator | `http://127.0.0.1:3001` | Simulator shares host loopback |
+| Local — Android emulator | `http://10.0.2.2:3001` | Emulator-only alias for host loopback |
+| Local — physical device on Wi-Fi | `http://<your-LAN-IP>:3001` | e.g. `http://192.168.1.42:3001` |
 | Staging / Prod | TBD | Inject via `--dart-define` at build time |
 
 All routes are prefixed with `/v1/`. Versioning is via URI segment — when we
 ship breaking changes, we'll mount `/v2/` in parallel.
 
+> **Port 3001, not 3000.** The local backend listens on 3001 because the
+> UrbanFlow backend already binds 3000 on the shared dev machine
+> (see [`local-testing.md`](./local-testing.md)). Production will go
+> back to a normal hostname so this won't surface in built apps —
+> only the local-dev base URL needs to know.
+
 ```dart
 const apiBaseUrl = String.fromEnvironment(
   'API_BASE_URL',
-  defaultValue: 'http://localhost:3000',
+  defaultValue: 'http://localhost:3001',
 );
 ```
 

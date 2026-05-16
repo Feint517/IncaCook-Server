@@ -32,9 +32,9 @@
 
 set -euo pipefail
 
-BASE_URL="${BASE_URL:-http://localhost:3000}"
+BASE_URL="${BASE_URL:-http://localhost:3001}"
 SUPABASE_URL="${SUPABASE_URL:-http://127.0.0.1:54321}"
-DB_CONTAINER="${DB_CONTAINER:-supabase_db_incacook-server}"
+DB_CONTAINER="${DB_CONTAINER:-supabase_db_IncaCook}"
 
 # Only used for cleanup (Supabase admin) — the rest of the script never hits
 # Supabase directly, mirroring what the Flutter app will do.

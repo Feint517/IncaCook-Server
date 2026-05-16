@@ -124,6 +124,54 @@ export class AuthService {
   }
 
   /**
+   * Temporary SMS-OTP bypass: sends a 6-digit code to the caller's own
+   * email (resolved from the JWT, never the body) via Supabase's email
+   * OTP. Pair with `verifyEmailOtp` to flip `User.phoneVerified` without
+   * an SMS roundtrip. Remove both methods + endpoints once the SMS
+   * provider is back.
+   */
+  async requestEmailOtp(email: string): Promise<void> {
+    const { error } = await this.anon.client.auth.signInWithOtp({
+      email,
+      options: { shouldCreateUser: false },
+    });
+    if (error) {
+      throw this.toHttpException(error, 'email OTP request failed');
+    }
+  }
+
+  /**
+   * Verifies the email OTP, then mirrors a verified phone signal onto the
+   * caller's User row (`phoneVerified = true`) so downstream gates that
+   * previously required SMS proof are satisfied. Returns the fresh
+   * Supabase session minted by verifyOtp.
+   */
+  async verifyEmailOtp(
+    supabaseId: string,
+    email: string,
+    code: string,
+  ): Promise<SessionResponseDto> {
+    const { data, error } = await this.anon.client.auth.verifyOtp({
+      email,
+      token: code,
+      type: 'email',
+    });
+    if (error || !data.session) {
+      throw this.toHttpException(
+        error ?? ({ message: 'OTP verification failed', status: 401 } as AuthError),
+        'email OTP verify failed',
+      );
+    }
+
+    await this.prisma.db.user.update({
+      where: { supabaseId },
+      data: { phoneVerified: true },
+    });
+
+    return this.toSession(data.session);
+  }
+
+  /**
    * Attaches a phone number to the authenticated user and triggers an OTP
    * send. Calling again with a different phone overwrites the pending
    * phone (Supabase last-write-wins on phone_change_token). The supabase-js

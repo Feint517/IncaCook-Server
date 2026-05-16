@@ -1,9 +1,11 @@
+name: IncaCook
+
 services:
   redis:
     image: redis:7-alpine
-    container_name: incacook-redis
+    container_name: IncaCook-redis
     ports:
-      - '6379:6379'
+      - '6380:6379'
     volumes:
       - incacook-redis-data:/data
     healthcheck:
@@ -11,13 +13,6 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
-
-  mailhog:
-    image: mailhog/mailhog:v1.0.1
-    container_name: incacook-mailhog
-    ports:
-      - '1025:1025' # SMTP
-      - '8025:8025' # Web UI
 
 volumes:
   incacook-redis-data:

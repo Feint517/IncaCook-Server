@@ -30,8 +30,8 @@ This service is the **only** consumer of the Supabase service role key. The mobi
 
 - Node.js **>= 22**
 - pnpm **>= 9** (this repo uses `corepack`-pinned `pnpm@9.15.0`)
-- Redis (local via `docker compose up redis`, or Upstash for remote)
-- A Supabase project (Postgres + Auth + Storage)
+- Redis and Mailhog (local via `docker compose up -d`)
+- Supabase CLI (local via `npx supabase start`)
 
 ---
 
@@ -45,8 +45,8 @@ pnpm install
 cp .env.example .env
 # Fill in required values (DATABASE_URL, SUPABASE_*, STRIPE_*, JWT_SECRET ...)
 
-# 3. Boot infra
-docker compose up -d redis
+# 3. Boot infra (Redis, Mailhog, and Supabase)
+pnpm start:services
 
 # 4. Generate Prisma client (no models yet — runs cleanly)
 pnpm prisma:generate
@@ -64,6 +64,8 @@ Once running, hit `http://localhost:3000/v1/health`.
 | Script | Purpose |
 |---|---|
 | `pnpm start` | Run compiled app |
+| `pnpm start:services` | Start local Redis, Mailhog, and Supabase containers |
+| `pnpm stop:services` | Stop local Redis, Mailhog, and Supabase containers |
 | `pnpm start:dev` | Hot-reloading dev server |
 | `pnpm start:debug` | Dev server with `--inspect` |
 | `pnpm start:worker:dev` | BullMQ worker process (dev) |

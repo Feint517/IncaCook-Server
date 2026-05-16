@@ -21,6 +21,7 @@ import { SessionResponseDto } from './dto/session-response.dto';
 import { SignInDto } from './dto/sign-in.dto';
 import { SignUpDto } from './dto/sign-up.dto';
 import { UpdatePasswordDto } from './dto/update-password.dto';
+import { VerifyEmailOtpDto } from './dto/verify-email-otp.dto';
 import { VerifyPhoneOtpDto } from './dto/verify-phone-otp.dto';
 
 @Controller({ path: 'auth', version: '1' })
@@ -84,6 +85,36 @@ export class AuthController {
     @Body() dto: UpdatePasswordDto,
   ): Promise<void> {
     return this.auth.updatePassword(jwtUser.id, dto.newPassword);
+  }
+
+  /**
+   * Temporary SMS bypass — sends a 6-digit code to the caller's own email
+   * (resolved from the JWT). Pair with POST /v1/auth/email/verify to flip
+   * `phoneVerified` without an SMS. Delete once the phone provider is back.
+   */
+  @Post('email/request-otp')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  async requestEmailOtp(@CurrentUser() jwtUser: AuthenticatedUser): Promise<void> {
+    if (!jwtUser.email) {
+      throw new BadRequestException('Authenticated user has no email on file');
+    }
+    await this.auth.requestEmailOtp(jwtUser.email);
+  }
+
+  /**
+   * Confirms the email OTP. On success we set `User.phoneVerified = true`
+   * (the actual bypass) and return a fresh session minted by Supabase.
+   */
+  @Post('email/verify')
+  @HttpCode(HttpStatus.OK)
+  verifyEmailOtp(
+    @CurrentUser() jwtUser: AuthenticatedUser,
+    @Body() dto: VerifyEmailOtpDto,
+  ): Promise<SessionResponseDto> {
+    if (!jwtUser.email) {
+      throw new BadRequestException('Authenticated user has no email on file');
+    }
+    return this.auth.verifyEmailOtp(jwtUser.id, jwtUser.email, dto.code);
   }
 
   /**

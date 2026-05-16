@@ -50,3 +50,6 @@ prisma/.env
 *.pem
 .cache/
 .turbo/
+
+# Local test accounts (gitignored — contains plaintext passwords)
+test-accounts.local.md

@@ -8,9 +8,9 @@
 #
 # Prerequisites:
 #   - `supabase start` running
-#   - `docker start incacook-test-redis` running
+#   - `docker compose up -d redis` running (container: IncaCook-redis)
 #   - `pnpm test:start:dev` running on :3000
-#   - `stripe listen --forward-to http://localhost:3000/v1/stripe/webhook`
+#   - `stripe listen --forward-to http://localhost:3001/v1/stripe/webhook`
 #     running (so payment_intent.succeeded webhooks reach the API)
 #   - .env.test has real Stripe test-mode keys
 #
@@ -22,8 +22,8 @@
 
 set -euo pipefail
 
-BASE_URL="${BASE_URL:-http://localhost:3000}"
-DB_CONTAINER="${DB_CONTAINER:-supabase_db_incacook-server}"
+BASE_URL="${BASE_URL:-http://localhost:3001}"
+DB_CONTAINER="${DB_CONTAINER:-supabase_db_IncaCook}"
 WEBHOOK_WAIT_SECONDS="${WEBHOOK_WAIT_SECONDS:-3}"
 
 # Pull STRIPE_SECRET_KEY out of .env.test for the transfers verification step.
@@ -77,8 +77,8 @@ if ! docker ps --filter "name=$DB_CONTAINER" --format '{{.Names}}' | grep -q "$D
 fi
 ok "Postgres container running"
 
-if ! docker ps --filter "name=incacook-test-redis" --format '{{.Names}}' | grep -q "incacook-test-redis"; then
-  fail "Redis container 'incacook-test-redis' not running — \`docker start incacook-test-redis\`?"
+if ! docker ps --filter "name=IncaCook-redis" --format '{{.Names}}' | grep -q "IncaCook-redis"; then
+  fail "Redis container 'IncaCook-redis' not running — \`docker compose up -d redis\`?"
 fi
 ok "Redis container running"
 
@@ -140,7 +140,7 @@ ok "Order $ORDER_ID  status=PENDING  buyerTotal=1750¢  pi=$PI_ID"
 step "Confirm PaymentIntent via Stripe test card"
 stripe payment_intents confirm "$PI_ID" \
   --payment-method=pm_card_visa \
-  --return-url=http://localhost:3000/stub > /dev/null 2>&1 || fail "PaymentIntent confirm failed"
+  --return-url=http://localhost:3001/stub > /dev/null 2>&1 || fail "PaymentIntent confirm failed"
 info "Waiting ${WEBHOOK_WAIT_SECONDS}s for webhook to fire..."
 sleep "$WEBHOOK_WAIT_SECONDS"
 
@@ -275,7 +275,7 @@ RESPONSE=$(curl -sf -X POST "$BASE_URL/v1/orders" \
 CANCEL_ORDER=$(json_get "$RESPONSE" "['data']['order']['id']")
 CANCEL_PI=$(json_get "$RESPONSE" "['data']['paymentIntentClientSecret']")
 CANCEL_PI=${CANCEL_PI%%_secret_*}
-stripe payment_intents confirm "$CANCEL_PI" --payment-method=pm_card_visa --return-url=http://localhost:3000/stub > /dev/null 2>&1
+stripe payment_intents confirm "$CANCEL_PI" --payment-method=pm_card_visa --return-url=http://localhost:3001/stub > /dev/null 2>&1
 sleep "$WEBHOOK_WAIT_SECONDS"
 STATUS=$(db_query "SELECT status FROM \"Order\" WHERE id = '$CANCEL_ORDER'")
 [ "$STATUS" = "CONFIRMED" ] || fail "Expected CONFIRMED got $STATUS"

@@ -13,9 +13,9 @@
 
 set -euo pipefail
 
-BASE_URL="${BASE_URL:-http://localhost:3000}"
+BASE_URL="${BASE_URL:-http://localhost:3001}"
 SUPABASE_URL="${SUPABASE_URL:-http://127.0.0.1:54321}"
-DB_CONTAINER="${DB_CONTAINER:-supabase_db_incacook-server}"
+DB_CONTAINER="${DB_CONTAINER:-supabase_db_IncaCook}"
 SERVICE_KEY="${SUPABASE_SERVICE_ROLE_KEY:-$(grep '^SUPABASE_SERVICE_ROLE_KEY=' .env.test | cut -d= -f2-)}"
 
 # Must match an entry in supabase/config.toml [auth.sms.test_otp].

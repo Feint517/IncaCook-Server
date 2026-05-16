@@ -8,6 +8,25 @@ just experimenting without touching the remote dev Supabase project.
 > role key, JWT secret) that ship with the Supabase CLI. They are public
 > knowledge — never reuse them in production.
 
+> **Ports are remapped from Supabase defaults.** IncaCook coexists on
+> this machine with the UrbanFlow project, which already binds the
+> defaults (54321-54324, 6379). To avoid clashes, IncaCook uses
+> **54331-54334** for Supabase and **6380** for Redis. Container names
+> are also suffixed `_IncaCook` (Supabase) / `IncaCook-redis` (Redis).
+>
+> | Service | IncaCook | Default |
+> |---|---|---|
+> | API / Kong | 54331 | 54321 |
+> | Postgres (DB) | 54332 | 54322 |
+> | Studio | 54333 | 54323 |
+> | Mailpit (Inbucket) | 54334 | 54324 |
+> | Analytics | 54337 | 54327 |
+> | Redis | 6380 | 6379 |
+> | Nest API (this server) | 3001 | 3000 |
+>
+> If you ever run a one-off `psql` / `curl` against the local stack,
+> use the IncaCook ports above. `.env.test` is already wired to these.
+
 ---
 
 ## 1. Prerequisites
@@ -55,15 +74,15 @@ the printout again unless something changes.
 
 ### 2.3 Start a Redis container
 
-The API uses Redis for cache + queues. Locally we run it as a one-off
-Docker container:
+The API uses Redis for cache + queues. The repo ships a `docker-compose.yml`
+that defines the `IncaCook-redis` container (with a persistent volume):
 
 ```bash
-docker run -d --name incacook-test-redis -p 6379:6379 redis:7-alpine
+docker compose up -d redis
 ```
 
-This survives reboots — subsequent sessions only need `docker start
-incacook-test-redis` (see §4).
+This survives reboots — subsequent sessions only need `docker compose
+up -d redis` (it's idempotent).
 
 ### 2.4 Create `.env.test`
 
@@ -85,7 +104,7 @@ pnpm test:db:migrate
 ```
 
 This applies every migration in `prisma/migrations/` to the local Postgres
-on port `54322`.
+on port `54332`.
 
 ### 2.6 Create the four Storage buckets
 
@@ -93,7 +112,7 @@ The local Supabase ships without buckets. The app references `avatars`,
 `listings`, `kyc`, and `seller-facades`. Create them once:
 
 ```bash
-docker exec supabase_db_incacook-server psql -U postgres -d postgres -c "
+docker exec supabase_db_IncaCook psql -U postgres -d postgres -c "
 INSERT INTO storage.buckets (id, name, public) VALUES
   ('avatars',         'avatars',         true),
   ('listings',        'listings',        true),
@@ -131,21 +150,21 @@ The seed is idempotent — re-running wipes and recreates these four users
 
 ```bash
 # Once per machine reboot
-docker start incacook-test-redis          # if stopped
+docker compose up -d redis                 # IncaCook-redis (idempotent)
 supabase start                             # idempotent — no-ops if already running
 
 # Boot the API
 pnpm test:start:dev
 ```
 
-The server is now listening on http://localhost:3000 with `.env.test`
+The server is now listening on http://localhost:3001 with `.env.test`
 loaded.
 
 ### 3.2 Mint test JWTs
 
 ```bash
 TOKEN=$(pnpm -s test:mint-jwt buyer)
-curl -H "Authorization: Bearer $TOKEN" http://localhost:3000/v1/users/me
+curl -H "Authorization: Bearer $TOKEN" http://localhost:3001/v1/users/me
 
 # Other roles:
 pnpm -s test:mint-jwt admin
@@ -157,10 +176,44 @@ Tokens are signed with the **local** Supabase JWT secret and last 24 h.
 Don't mix them with tokens minted against `.env` (those use the remote
 secret).
 
+#### Live signup-flow test accounts
+
+Separate from the four seeded `test+role@incacook.test` users, three
+real-email accounts are reserved for end-to-end signup testing (so the
+flow exercises `POST /v1/auth/signup` rather than the seeder's direct
+inserts). Credentials live in the gitignored
+[`test-accounts.local.md`](../test-accounts.local.md). The Mailpit
+inbox at http://127.0.0.1:54334 catches the OTP emails — no real Gmail
+delivery.
+
+### 3.2a Verify the phone gate via email OTP (temporary bypass)
+
+While the SMS provider is unavailable, `POST /v1/auth/email/request-otp`
++ `POST /v1/auth/email/verify` flip `User.phoneVerified` using an email
+code instead of an SMS code. See [signup-flow.md §3.9](signup-flow.md#39-post-v1authphoneverify--bearer)
+for the API.
+
+Locally:
+
+```bash
+TOKEN=$(pnpm -s test:mint-jwt seller)
+curl -fsS -X POST -H "Authorization: Bearer $TOKEN" \
+  http://localhost:3001/v1/auth/email/request-otp
+# → 204; the 6-digit code lands in Mailpit (see §3.3) for the test
+#   account's email. Copy it, then:
+curl -fsS -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"code":"123456"}' \
+  http://localhost:3001/v1/auth/email/verify
+```
+
+The Mailpit inbox at http://127.0.0.1:54334 catches all Supabase auth
+emails — no real send. Codes expire after a few minutes.
+
 ### 3.3 Browse the local Postgres / Storage
 
-- **Supabase Studio**: http://127.0.0.1:54323 — DB browser, storage UI
-- **Mailpit**: http://127.0.0.1:54324 — local email inbox
+- **Supabase Studio**: http://127.0.0.1:54333 — DB browser, storage UI
+- **Mailpit**: http://127.0.0.1:54334 — local email inbox
 - **Prisma Studio**: `pnpm prisma:studio` (against whichever env's
   `DATABASE_URL` is set; for test env prefix with `dotenv -e .env.test --`)
 
@@ -212,14 +265,15 @@ supabase stop --no-backup
 ### 4.3 Stop Redis
 
 ```bash
-docker stop incacook-test-redis
+docker compose stop redis
 ```
 
-This stops the container but keeps it around. Restart with `docker start
-incacook-test-redis`. To remove it entirely:
+This stops the container but keeps it around (and the data volume).
+Restart with `docker compose up -d redis`. To remove the container and
+the data volume entirely:
 
 ```bash
-docker rm -f incacook-test-redis
+docker compose down -v
 ```
 
 ### 4.4 Full teardown (rare — only when freeing disk space)
@@ -227,8 +281,9 @@ docker rm -f incacook-test-redis
 ```bash
 pkill -f "nest start --watch"      # API
 supabase stop --no-backup           # Supabase + DB volume
-docker rm -f incacook-test-redis    # Redis container
-# To also remove the Supabase Docker images (~3 GB):
+docker compose down -v              # IncaCook-redis + its data volume
+# To also remove the Supabase Docker images (~3 GB) — note: shared with
+# other Supabase projects on this machine, removing affects them too:
 docker images | grep supabase | awk '{print $3}' | xargs docker rmi
 ```
 
@@ -236,18 +291,14 @@ docker images | grep supabase | awk '{print $3}' | xargs docker rmi
 
 ## 5. Troubleshooting
 
-### `pnpm test:start:dev` exits with `ECONNREFUSED ::1:6379`
+### `pnpm test:start:dev` exits with `ECONNREFUSED ::1:6380`
 
 Redis isn't running. Start it:
 ```bash
-docker start incacook-test-redis
-```
-Or create it if you've never run §2.3:
-```bash
-docker run -d --name incacook-test-redis -p 6379:6379 redis:7-alpine
+docker compose up -d redis
 ```
 
-### `Can't reach database server at 127.0.0.1:54322`
+### `Can't reach database server at 127.0.0.1:54332`
 
 Supabase isn't running. `supabase start`.
 
@@ -264,7 +315,7 @@ Add a header — any string is fine for testing:
 with real test-mode keys from your Stripe dashboard for any payment-related
 flow. The Stripe webhook secret comes from running:
 ```bash
-stripe listen --forward-to http://localhost:3000/v1/stripe/webhook
+stripe listen --forward-to http://localhost:3001/v1/stripe/webhook
 ```
 which prints a `whsec_...` you paste into `.env.test`.
 
@@ -308,16 +359,16 @@ If you're recreating `.env.test` from scratch, this is the working template:
 
 ```bash
 NODE_ENV=test
-PORT=3000
-APP_URL=http://localhost:3000
-ALLOWED_ORIGINS=http://localhost:3000,http://localhost:8081
+PORT=3001
+APP_URL=http://localhost:3001
+ALLOWED_ORIGINS=http://localhost:3001,http://localhost:8081
 
 # Local Supabase Postgres (no pooler locally — both URLs hit the direct port)
-DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:54322/postgres
-DIRECT_URL=postgresql://postgres:postgres@127.0.0.1:54322/postgres
+DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:54332/postgres
+DIRECT_URL=postgresql://postgres:postgres@127.0.0.1:54332/postgres
 
 # Local Supabase (defaults from the CLI — public)
-SUPABASE_URL=http://127.0.0.1:54321
+SUPABASE_URL=http://127.0.0.1:54331
 SUPABASE_ANON_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6ImFub24iLCJleHAiOjE5ODM4MTI5OTZ9.CRXP1A7WOeoJeXxjNni43kdQwgnWNReilDMblYTn_I0
 SUPABASE_SERVICE_ROLE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImV4cCI6MTk4MzgxMjk5Nn0.EGIM96RAZx35lJzdJsyH-qQwv8Hdp7fsn3W0YpN81IU
 SUPABASE_JWT_SECRET=super-secret-jwt-token-with-at-least-32-characters-long
@@ -326,17 +377,17 @@ SUPABASE_STORAGE_BUCKET_LISTINGS=listings
 SUPABASE_STORAGE_BUCKET_KYC=kyc
 SUPABASE_STORAGE_BUCKET_AVATARS=avatars
 
-REDIS_URL=redis://localhost:6379
+REDIS_URL=redis://localhost:6380
 REDIS_HOST=localhost
-REDIS_PORT=6379
+REDIS_PORT=6380
 
 # Replace with your real test-mode Stripe keys when ready to test payments
 STRIPE_SECRET_KEY=sk_test_xxx
 STRIPE_PUBLISHABLE_KEY=pk_test_xxx
 STRIPE_WEBHOOK_SECRET=whsec_xxx
 STRIPE_CONNECT_CLIENT_ID=ca_xxx
-STRIPE_ONBOARDING_RETURN_URL=http://localhost:3000/stub/stripe/return
-STRIPE_ONBOARDING_REFRESH_URL=http://localhost:3000/stub/stripe/refresh
+STRIPE_ONBOARDING_RETURN_URL=http://localhost:3001/stub/stripe/return
+STRIPE_ONBOARDING_REFRESH_URL=http://localhost:3001/stub/stripe/refresh
 
 JWT_SECRET=local-test-jwt-secret-not-for-production-use-32+chars
 JWT_EXPIRATION=7d
