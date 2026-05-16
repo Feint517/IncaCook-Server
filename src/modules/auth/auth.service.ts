@@ -193,10 +193,22 @@ export class AuthService {
       );
     }
 
-    await this.prisma.db.user.update({
-      where: { supabaseId },
-      data: { phoneVerified: true },
-    });
+    // Best-effort mirror onto our User row. The row may not exist yet
+    // (Google sign-in → email OTP before POST /v1/users). That's fine
+    // here: Supabase has already set `auth.users.email_confirmed_at`,
+    // and UsersService picks that up when the row is eventually created.
+    try {
+      await this.prisma.db.user.update({
+        where: { supabaseId },
+        data: { phoneVerified: true },
+      });
+    } catch (err) {
+      const code = (err as { code?: string } | null)?.code;
+      if (code !== 'P2025') throw err;
+      this.logger.debug(
+        `email OTP verified, no User row to mirror onto yet (Gate 2 pending) supabaseId=${supabaseId}`,
+      );
+    }
 
     return this.toSession(data.session);
   }

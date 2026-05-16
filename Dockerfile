@@ -4,7 +4,11 @@
 FROM node:22-alpine AS deps
 WORKDIR /app
 RUN corepack enable && corepack prepare pnpm@9.15.0 --activate
+# Copy the Prisma schema first so the @prisma/client postinstall hook
+# can generate the typed client (otherwise enums like KycDocType end
+# up `undefined` at runtime and decorators like @IsEnum() crash boot).
 COPY package.json pnpm-lock.yaml .npmrc ./
+COPY prisma ./prisma
 RUN pnpm install --frozen-lockfile
 
 # ---------- Stage 2: build ----------

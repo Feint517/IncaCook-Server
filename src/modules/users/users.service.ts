@@ -21,6 +21,7 @@ import { UserRole } from '@common/enums/user-role.enum';
 import { generateUlid } from '@common/utils/code-generator.util';
 
 import { PrismaService } from '@infrastructure/database/prisma.service';
+import { SupabaseAdminService } from '@infrastructure/supabase/supabase-admin.service';
 
 import { CreateUserDto } from './dto/create-user.dto';
 import { RecordCharterDto } from './dto/record-charter.dto';
@@ -82,7 +83,10 @@ export interface UserAggregate {
 
 @Injectable()
 export class UsersService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly admin: SupabaseAdminService,
+  ) {}
 
   async findBySupabaseId(supabaseId: string): Promise<UserAggregate> {
     const user = await this.prisma.db.user.findUnique({
@@ -171,6 +175,16 @@ export class UsersService {
 
     const userId = generateUlid();
 
+    // SMS-OTP bypass: if Supabase has already confirmed the email (Google
+    // sign-in, or a separate email OTP run before Gate 2), trust that as
+    // proof of contactability and default `phoneVerified = true`. Removes
+    // the ordering constraint between /v1/auth/email/verify and Gate 2.
+    // Once the SMS provider is back this can revert to a hard `false`.
+    const supabaseUser = await this.admin.client.auth.admin.getUserById(
+      identity.supabaseId,
+    );
+    const phoneVerified = supabaseUser.data.user?.email_confirmed_at != null;
+
     await this.prisma.$transaction(async (tx) => {
       await tx.user.create({
         data: {
@@ -181,6 +195,7 @@ export class UsersService {
           role: dto.role,
           firstName: dto.firstName,
           lastName: dto.lastName,
+          phoneVerified,
           acceptedCgu: dto.acceptedCgu,
           acceptedCgv: dto.acceptedCgv,
           acceptedAt: new Date(),

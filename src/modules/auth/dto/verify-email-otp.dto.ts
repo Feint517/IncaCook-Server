@@ -8,6 +8,9 @@ import { IsString, Matches } from 'class-validator';
  */
 export class VerifyEmailOtpDto {
   @IsString()
-  @Matches(/^\d{6}$/, { message: 'code must be 6 digits' })
+  // Supabase's OTP length is a per-project setting (currently 6-10 digits;
+  // 6 on local CLI, 8 by default on cloud). Match the same range as the
+  // phone OTP DTO so future config changes don't require a redeploy.
+  @Matches(/^\d{6,10}$/, { message: 'code must be 6-10 digits' })
   code!: string;
 }
