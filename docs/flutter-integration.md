@@ -7,7 +7,7 @@ base URL, single auth surface.
 For deeper specifications:
 - [`api-conventions.md`](./api-conventions.md) — versioning, idempotency, pagination conventions
 - [`error-codes.md`](./error-codes.md) — full `INCACOOK_*` taxonomy
-- [`local-testing.md`](./local-testing.md) — running the backend + Supabase stack locally
+- [`local-development.md`](./local-development.md) — running the backend + Supabase stack locally
 
 ---
 
@@ -25,7 +25,7 @@ ship breaking changes, we'll mount `/v2/` in parallel.
 
 > **Port 3001, not 3000.** The local backend listens on 3001 because the
 > UrbanFlow backend already binds 3000 on the shared dev machine
-> (see [`local-testing.md`](./local-testing.md)). Production will go
+> (see [`local-development.md`](./local-development.md)). Production will go
 > back to a normal hostname so this won't surface in built apps —
 > only the local-dev base URL needs to know.
 

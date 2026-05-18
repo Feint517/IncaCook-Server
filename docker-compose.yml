@@ -1,9 +1,9 @@
-name: IncaCook
+name: incacook-services
 
 services:
   redis:
     image: redis:7-alpine
-    container_name: IncaCook-redis
+    container_name: incacook-redis
     ports:
       - '6380:6379'
     volumes:
