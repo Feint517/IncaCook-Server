@@ -220,17 +220,17 @@ Source: [id_document_type.dart](lib/features/authentication/data/models/id_docum
 | price | `double` | `price` | `numeric(10,2)` | |
 | original_price | `double?` | `original_price` | `numeric(10,2)` | pre-discount |
 | discount_percent | `int` | `discount_percent` | `int` | 0–100; could be derived |
-| portions_left | `int` | `portions_left` | `int` | inventory |
+| portions_left | `int?` | `portions_left` | `int` (nullable) | inventory; `null` = "cook to order" (restaurant/traiteur); required for fait_maison (API-enforced) |
 | fulfillment | `Fulfillment` | `fulfillment` | enum `fulfillment` | delivery \| pickup \| both |
-| expires_at | `DateTime` | `expires_at` | `timestamptz` | |
+| expires_at | `DateTime?` | `expires_at` | `timestamptz` (nullable) | `null` = permanent menu item (restaurant/traiteur); required for fait_maison (API-enforced) |
 | prep_minutes | `int?` | `prep_minutes` | `int` | |
 | is_available | `bool` | `is_available` | `bool` | seller toggle |
 | is_veg | `bool` | `is_veg` | `bool` | vegetarian (looser than `DietaryTag.vegan`) |
 | menu_category | `String?` | `menu_category` | `text` | seller's free-text sub-category ("Pizza mixte") |
 | category | `SellerCategory` | `category` | enum `seller_category` | derived from seller; denormalize for filter perf |
 | dietary_tags | `List<DietaryTag>` | `dietary_tags` | `dietary_tag[]` | |
-| cuisine_type | `CuisineType?` | `cuisine_type` | enum `cuisine_type` | |
-| dish_type | `DishType?` | `dish_type` | enum `dish_type` | |
+| cuisine_types | `List<CuisineType>` | `cuisine_types` | enum `cuisine_type[]` | multi-select; OR semantics in feed filter (GIN-indexed) |
+| dish_types | `List<DishType>` | `dish_types` | enum `dish_type[]` | multi-select; OR semantics in feed filter (GIN-indexed); `BOISSON` valid for restaurant/traiteur |
 | allergens | `List<Allergen>` | `allergens` | `allergen[]` | empty list = "no allergens declared" |
 | other_allergens | `String?` | `other_allergens` | `text` | free-text allergens not in the 14-item enum |
 | created_at | | `created_at` | `timestamptz` | |

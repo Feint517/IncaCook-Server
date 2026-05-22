@@ -28,9 +28,9 @@ import { CreateListingAddOnDto } from './create-listing-add-on.dto';
  * Body for `PATCH /v1/listings/:id`. All fields optional; only the supplied
  * fields are updated.
  *
- * `addOns` is a full-replacement field: if present, the listing's add-on
+ * `extras` is a full-replacement field: if present, the listing's extras
  * set is replaced with the supplied array (cascade-delete + insert in one
- * transaction). Omit it to leave add-ons unchanged.
+ * transaction). Omit it to leave extras unchanged.
  */
 export class UpdateListingDto {
   @IsOptional() @IsString() @MinLength(1) @MaxLength(200)
@@ -54,11 +54,11 @@ export class UpdateListingDto {
   @IsOptional() @IsInt() @Min(0)
   portionsLeft?: number;
 
-  @IsOptional() @IsEnum(CuisineType)
-  cuisineType?: CuisineType;
+  @IsOptional() @IsArray() @IsEnum(CuisineType, { each: true }) @ArrayUnique()
+  cuisineTypes?: CuisineType[];
 
-  @IsOptional() @IsEnum(DishType)
-  dishType?: DishType;
+  @IsOptional() @IsArray() @IsEnum(DishType, { each: true }) @ArrayUnique()
+  dishTypes?: DishType[];
 
   @IsOptional() @IsArray() @IsEnum(DietaryTag, { each: true }) @ArrayUnique()
   dietaryTags?: DietaryTag[];
@@ -89,8 +89,8 @@ export class UpdateListingDto {
 
   @IsOptional()
   @IsArray()
-  @ArrayMaxSize(50)
+  @ArrayMaxSize(20)
   @ValidateNested({ each: true })
   @Type(() => CreateListingAddOnDto)
-  addOns?: CreateListingAddOnDto[];
+  extras?: CreateListingAddOnDto[];
 }

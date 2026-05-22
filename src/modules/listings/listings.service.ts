@@ -4,10 +4,12 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { AddressKind, Prisma } from '@prisma/client';
-import type { Listing, ListingAddOn } from '@prisma/client';
+import { AddressKind, DishType, KycStatus, Prisma, SellerCategory } from '@prisma/client';
+import type { Listing, ListingAddOn, SellerProfile } from '@prisma/client';
 
+import { ErrorCodes } from '@common/constants/error-codes.constants';
 import { UserRole } from '@common/enums/user-role.enum';
+import { BusinessRuleException } from '@common/exceptions/business-rule.exception';
 import { generateUlid } from '@common/utils/code-generator.util';
 
 import { PrismaService } from '@infrastructure/database/prisma.service';
@@ -20,6 +22,38 @@ import { UpdateListingDto } from './dto/update-listing.dto';
 type ListingWithAddOns = Listing & { addOns: ListingAddOn[] };
 type Tx = Prisma.TransactionClient;
 
+/**
+ * Fait-maison price cap in cents (€4.50). Kept in sync with the Flutter
+ * client's `faitMaisonPriceCap` constant — see docs/posting-module.md §2.2.
+ */
+const FAIT_MAISON_PRICE_CAP_CENTS = 450;
+
+/**
+ * Which `DishType` values are valid for each seller category. Mirrors the
+ * Flutter `DishType.valuesFor(category)` source of truth — see
+ * docs/posting-module.md §2.6.c.
+ *
+ * fait_maison: empty — fait-maison sellers don't classify dishes by type.
+ * restaurant : entrée, plat, dessert, boisson.
+ * traiteur   : same as restaurant + cocktail dînatoire.
+ */
+const DISH_TYPES_BY_CATEGORY: Record<SellerCategory, ReadonlySet<DishType>> = {
+  [SellerCategory.FAIT_MAISON]: new Set(),
+  [SellerCategory.RESTAURANT]: new Set([
+    DishType.ENTREE,
+    DishType.PLAT,
+    DishType.DESSERT,
+    DishType.BOISSON,
+  ]),
+  [SellerCategory.TRAITEUR]: new Set([
+    DishType.ENTREE,
+    DishType.PLAT,
+    DishType.DESSERT,
+    DishType.BOISSON,
+    DishType.COCKTAIL_DINATOIRE,
+  ]),
+};
+
 /** Raw row shape returned by the feed SQL. Mirrors Listing + denormalized
  *  fields. Quoted camelCase aliases keep Postgres from lower-casing them. */
 export interface FeedRow {
@@ -31,9 +65,9 @@ export interface FeedRow {
   priceCents: number;
   originalPriceCents: number | null;
   discountPercent: number | null;
-  portionsLeft: number;
-  cuisineType: string | null;
-  dishType: string | null;
+  portionsLeft: number | null;
+  cuisineTypes: string[];
+  dishTypes: string[];
   dietaryTags: string[];
   allergens: string[];
   otherAllergens: string | null;
@@ -43,7 +77,7 @@ export interface FeedRow {
   category: string;
   fulfillment: string;
   prepMinutes: number;
-  expiresAt: Date;
+  expiresAt: Date | null;
   createdAt: Date;
   updatedAt: Date;
   sellerName: string;
@@ -66,8 +100,15 @@ export interface FeedResult {
 export class ListingsService {
   constructor(private readonly prisma: PrismaService) {}
 
-  /** Resolves the JWT user to the seller's userId, or throws. */
-  private async assertSeller(supabaseId: string): Promise<string> {
+  /**
+   * Resolves the JWT user to the seller's userId.
+   * `requireKycApproved` adds a 403 KYC_NOT_APPROVED gate for mutations
+   * (POST/PATCH) — DELETE and availability toggles can run for any status.
+   */
+  private async assertSeller(
+    supabaseId: string,
+    opts: { requireKycApproved: boolean } = { requireKycApproved: false },
+  ): Promise<{ sellerId: string; profile: SellerProfile }> {
     const user = await this.prisma.db.user.findUnique({
       where: { supabaseId },
       include: { sellerProfile: true },
@@ -78,33 +119,42 @@ export class ListingsService {
     if (user.role !== UserRole.Seller || !user.sellerProfile) {
       throw new ForbiddenException('Only sellers can manage listings');
     }
-    return user.id;
+    if (opts.requireKycApproved && user.sellerProfile.kycStatus !== KycStatus.APPROVED) {
+      throw new ForbiddenException('KYC_NOT_APPROVED');
+    }
+    return { sellerId: user.id, profile: user.sellerProfile };
   }
 
   async create(supabaseId: string, dto: CreateListingDto): Promise<ListingWithAddOns> {
-    const sellerId = await this.assertSeller(supabaseId);
-
-    const seller = await this.prisma.db.sellerProfile.findUnique({
-      where: { userId: sellerId },
+    const { sellerId, profile: seller } = await this.assertSeller(supabaseId, {
+      requireKycApproved: true,
     });
-    if (!seller) {
-      throw new ForbiddenException('Only sellers can manage listings');
-    }
-    // Phase A: seller profile rows are stubs until the wizard fills them
-    // in. Listings need at minimum a category (denormalized onto Listing
-    // for filtering). Phase C's onboarding endpoint will surface a richer
-    // "canList" check; for now we just gate on category presence.
     if (!seller.category) {
       throw new ForbiddenException(
         'Complete your seller profile before creating listings',
       );
     }
 
-    validateListingShape(dto);
-    const expiresAt = parseFutureDate(dto.expiresAt, 'expiresAt');
-    // Capture across the transaction-closure boundary so the non-null
-    // narrowing from the guard above is preserved.
     const category = seller.category;
+    validateListingShape({
+      imageUrls: dto.imageUrls,
+      priceCents: dto.priceCents,
+      originalPriceCents: dto.originalPriceCents,
+      discountPercent: dto.discountPercent,
+      category,
+    });
+    validateCategoryShape(
+      {
+        priceCents: dto.priceCents,
+        portionsLeft: dto.portionsLeft,
+        expiresAt: dto.expiresAt,
+        dishTypes: dto.dishTypes,
+      },
+      category,
+    );
+
+    const expiresAt =
+      dto.expiresAt !== undefined ? parseFutureDate(dto.expiresAt, 'expiresAt') : null;
 
     const id = generateUlid();
     return this.prisma.$transaction(async (tx) => {
@@ -120,9 +170,9 @@ export class ListingsService {
           priceCents: dto.priceCents,
           originalPriceCents: dto.originalPriceCents ?? null,
           discountPercent: dto.discountPercent ?? null,
-          portionsLeft: dto.portionsLeft,
-          cuisineType: dto.cuisineType ?? null,
-          dishType: dto.dishType ?? null,
+          portionsLeft: dto.portionsLeft ?? null,
+          cuisineTypes: dto.cuisineTypes ?? [],
+          dishTypes: dto.dishTypes ?? [],
           dietaryTags: dto.dietaryTags ?? [],
           allergens: dto.allergens ?? [],
           otherAllergens: dto.otherAllergens ?? null,
@@ -135,8 +185,8 @@ export class ListingsService {
         },
       });
 
-      if (dto.addOns && dto.addOns.length > 0) {
-        await this.replaceAddOns(tx, id, dto.addOns);
+      if (dto.extras && dto.extras.length > 0) {
+        await this.replaceExtras(tx, id, dto.extras);
       }
 
       return this.loadWithAddOns(tx, id);
@@ -148,16 +198,16 @@ export class ListingsService {
       where: { id },
       include: { addOns: true },
     });
-    if (!listing) {
+    if (!listing || listing.deletedAt !== null) {
       throw new NotFoundException('Listing not found');
     }
     return listing;
   }
 
   async findMine(supabaseId: string): Promise<ListingWithAddOns[]> {
-    const sellerId = await this.assertSeller(supabaseId);
+    const { sellerId } = await this.assertSeller(supabaseId);
     return this.prisma.db.listing.findMany({
-      where: { sellerId },
+      where: { sellerId, deletedAt: null },
       include: { addOns: true },
       orderBy: { createdAt: 'desc' },
     });
@@ -168,19 +218,29 @@ export class ListingsService {
     id: string,
     dto: UpdateListingDto,
   ): Promise<ListingWithAddOns> {
-    const sellerId = await this.assertSeller(supabaseId);
+    const { sellerId } = await this.assertSeller(supabaseId, { requireKycApproved: true });
 
     const existing = await this.prisma.db.listing.findUnique({ where: { id } });
-    if (!existing) {
+    if (!existing || existing.deletedAt !== null) {
       throw new NotFoundException('Listing not found');
     }
     if (existing.sellerId !== sellerId) {
-      throw new ForbiddenException('Cannot edit another seller\'s listing');
+      throw new ForbiddenException("Cannot edit another seller's listing");
     }
 
     // Cross-field validations apply to the merged shape (existing ⊕ dto).
     const merged = mergeForValidation(existing, dto);
     validateListingShape(merged);
+    validateCategoryShape(
+      {
+        priceCents: merged.priceCents,
+        portionsLeft: merged.portionsLeft,
+        // `expiresAt` here is the merged Date|null; the helper accepts both.
+        expiresAt: merged.expiresAt,
+        dishTypes: merged.dishTypes,
+      },
+      existing.category,
+    );
 
     const data: Prisma.ListingUpdateInput = {};
     if (dto.name !== undefined) data.name = dto.name;
@@ -190,8 +250,8 @@ export class ListingsService {
     if (dto.originalPriceCents !== undefined) data.originalPriceCents = dto.originalPriceCents;
     if (dto.discountPercent !== undefined) data.discountPercent = dto.discountPercent;
     if (dto.portionsLeft !== undefined) data.portionsLeft = dto.portionsLeft;
-    if (dto.cuisineType !== undefined) data.cuisineType = dto.cuisineType;
-    if (dto.dishType !== undefined) data.dishType = dto.dishType;
+    if (dto.cuisineTypes !== undefined) data.cuisineTypes = dto.cuisineTypes;
+    if (dto.dishTypes !== undefined) data.dishTypes = dto.dishTypes;
     if (dto.dietaryTags !== undefined) data.dietaryTags = dto.dietaryTags;
     if (dto.allergens !== undefined) data.allergens = dto.allergens;
     if (dto.otherAllergens !== undefined) data.otherAllergens = dto.otherAllergens ?? null;
@@ -207,11 +267,11 @@ export class ListingsService {
     return this.prisma.$transaction(async (tx) => {
       await tx.listing.update({ where: { id }, data });
 
-      if (dto.addOns !== undefined) {
-        // Replace-on-update: clear existing add-ons, insert the new set.
+      if (dto.extras !== undefined) {
+        // Replace-on-update: clear existing extras, insert the new set.
         await tx.listingAddOn.deleteMany({ where: { listingId: id } });
-        if (dto.addOns.length > 0) {
-          await this.replaceAddOns(tx, id, dto.addOns);
+        if (dto.extras.length > 0) {
+          await this.replaceExtras(tx, id, dto.extras);
         }
       }
 
@@ -224,13 +284,13 @@ export class ListingsService {
     id: string,
     isAvailable: boolean,
   ): Promise<ListingWithAddOns> {
-    const sellerId = await this.assertSeller(supabaseId);
+    const { sellerId } = await this.assertSeller(supabaseId);
     const existing = await this.prisma.db.listing.findUnique({ where: { id } });
-    if (!existing) {
+    if (!existing || existing.deletedAt !== null) {
       throw new NotFoundException('Listing not found');
     }
     if (existing.sellerId !== sellerId) {
-      throw new ForbiddenException('Cannot edit another seller\'s listing');
+      throw new ForbiddenException("Cannot edit another seller's listing");
     }
 
     return this.prisma.$transaction(async (tx) => {
@@ -243,6 +303,9 @@ export class ListingsService {
    * Buyer feed. Joins SellerProfile + User, applies the visibility gate
    * (kycStatus = APPROVED, user not deleted, listing live), filters per
    * query params, sorts, paginates with hasMore via fetch+1.
+   *
+   * Visibility: `expiresAt IS NULL OR expiresAt > now()` — restaurant /
+   * traiteur listings with no expiry are permanent menu items.
    *
    * Distance: PostGIS ST_Distance / 1000 from the buyer point. Buyer point
    * comes from query lat/lng if present, otherwise the buyer's saved
@@ -274,7 +337,7 @@ export class ListingsService {
     const conditions: Prisma.Sql[] = [
       Prisma.sql`l."deletedAt" IS NULL`,
       Prisma.sql`l."isAvailable" = true`,
-      Prisma.sql`l."expiresAt" > now()`,
+      Prisma.sql`(l."expiresAt" IS NULL OR l."expiresAt" > now())`,
       Prisma.sql`sp."kycStatus" = 'APPROVED'::"KycStatus"`,
       Prisma.sql`u."deletedAt" IS NULL`,
     ];
@@ -282,11 +345,16 @@ export class ListingsService {
     if (query.category) {
       conditions.push(Prisma.sql`l."category" = ${query.category}::"SellerCategory"`);
     }
-    if (query.cuisineType) {
-      conditions.push(Prisma.sql`l."cuisineType" = ${query.cuisineType}::"CuisineType"`);
+    if (query.cuisineTypes && query.cuisineTypes.length > 0) {
+      // Array overlap — listing matches if ANY of its cuisines is in the query set.
+      conditions.push(
+        Prisma.sql`l."cuisineTypes" && ${query.cuisineTypes}::"CuisineType"[]`,
+      );
     }
-    if (query.dishType) {
-      conditions.push(Prisma.sql`l."dishType" = ${query.dishType}::"DishType"`);
+    if (query.dishTypes && query.dishTypes.length > 0) {
+      conditions.push(
+        Prisma.sql`l."dishTypes" && ${query.dishTypes}::"DishType"[]`,
+      );
     }
     if (query.fulfillment) {
       conditions.push(Prisma.sql`l."fulfillment" = ${query.fulfillment}::"Fulfillment"`);
@@ -366,8 +434,8 @@ export class ListingsService {
         l."originalPriceCents",
         l."discountPercent",
         l."portionsLeft",
-        l."cuisineType",
-        l."dishType",
+        l."cuisineTypes",
+        l."dishTypes",
         l."dietaryTags",
         l."allergens",
         l."otherAllergens",
@@ -437,13 +505,13 @@ export class ListingsService {
   }
 
   async softDelete(supabaseId: string, id: string): Promise<void> {
-    const sellerId = await this.assertSeller(supabaseId);
+    const { sellerId } = await this.assertSeller(supabaseId);
     const existing = await this.prisma.db.listing.findUnique({ where: { id } });
-    if (!existing) {
+    if (!existing || existing.deletedAt !== null) {
       throw new NotFoundException('Listing not found');
     }
     if (existing.sellerId !== sellerId) {
-      throw new ForbiddenException('Cannot delete another seller\'s listing');
+      throw new ForbiddenException("Cannot delete another seller's listing");
     }
     await this.prisma.db.listing.update({
       where: { id },
@@ -453,18 +521,18 @@ export class ListingsService {
 
   // ---------- helpers ----------
 
-  private async replaceAddOns(
+  private async replaceExtras(
     tx: Tx,
     listingId: string,
-    addOns: CreateListingAddOnDto[],
+    extras: CreateListingAddOnDto[],
   ): Promise<void> {
     await tx.listingAddOn.createMany({
-      data: addOns.map((addOn, idx) => ({
+      data: extras.map((extra, idx) => ({
         id: generateUlid(),
         listingId,
-        label: addOn.label,
-        priceDeltaCents: addOn.priceDeltaCents,
-        isSelectedByDefault: addOn.isSelectedByDefault ?? false,
+        label: extra.label,
+        priceDeltaCents: extra.priceDeltaCents,
+        isSelectedByDefault: extra.isSelectedByDefault ?? false,
         sortOrder: idx,
       })),
     });
@@ -492,6 +560,7 @@ interface ListingShape {
   priceCents?: number;
   originalPriceCents?: number | null;
   discountPercent?: number | null;
+  category?: SellerCategory;
 }
 
 function validateListingShape(s: ListingShape): void {
@@ -507,7 +576,59 @@ function validateListingShape(s: ListingShape): void {
   }
 }
 
-function mergeForValidation(existing: Listing, dto: UpdateListingDto): ListingShape {
+/**
+ * Category-conditional rules (docs/posting-module.md §2.2, §2.6.a, §2.6.c):
+ *   - fait_maison: priceCents <= 450; portionsLeft + expiresAt required; no dishTypes.
+ *   - restaurant / traiteur: portionsLeft + expiresAt optional.
+ *   - dishTypes values must be in DISH_TYPES_BY_CATEGORY[category].
+ */
+function validateCategoryShape(
+  s: {
+    priceCents?: number;
+    portionsLeft?: number | null;
+    expiresAt?: string | Date | null;
+    dishTypes?: DishType[];
+  },
+  category: SellerCategory,
+): void {
+  if (category === SellerCategory.FAIT_MAISON) {
+    if (s.priceCents !== undefined && s.priceCents > FAIT_MAISON_PRICE_CAP_CENTS) {
+      throw new BusinessRuleException(
+        ErrorCodes.PriceCapExceeded,
+        `Fait-maison listings are capped at ${(FAIT_MAISON_PRICE_CAP_CENTS / 100).toFixed(2)}€`,
+      );
+    }
+    if (s.portionsLeft === undefined || s.portionsLeft === null) {
+      throw new BadRequestException('fait_maison listings require portionsLeft');
+    }
+    if (s.expiresAt === undefined || s.expiresAt === null) {
+      throw new BadRequestException('fait_maison listings require expiresAt');
+    }
+  }
+
+  if (s.dishTypes && s.dishTypes.length > 0) {
+    const allowed = DISH_TYPES_BY_CATEGORY[category];
+    const invalid = s.dishTypes.filter((dt) => !allowed.has(dt));
+    if (invalid.length > 0) {
+      const allowedList = Array.from(allowed);
+      throw new BadRequestException(
+        `dishTypes ${JSON.stringify(invalid)} not allowed for ${category}` +
+          (allowedList.length === 0
+            ? ' (no dish types are allowed for this category)'
+            : ` — allowed: ${JSON.stringify(allowedList)}`),
+      );
+    }
+  }
+}
+
+function mergeForValidation(
+  existing: Listing,
+  dto: UpdateListingDto,
+): ListingShape & {
+  portionsLeft?: number | null;
+  expiresAt?: Date | null;
+  dishTypes?: DishType[];
+} {
   return {
     imageUrls: dto.imageUrls ?? existing.imageUrls,
     priceCents: dto.priceCents ?? existing.priceCents,
@@ -515,6 +636,13 @@ function mergeForValidation(existing: Listing, dto: UpdateListingDto): ListingSh
       dto.originalPriceCents !== undefined ? dto.originalPriceCents : existing.originalPriceCents,
     discountPercent:
       dto.discountPercent !== undefined ? dto.discountPercent : existing.discountPercent,
+    portionsLeft: dto.portionsLeft !== undefined ? dto.portionsLeft : existing.portionsLeft,
+    expiresAt:
+      dto.expiresAt !== undefined
+        ? parseFutureDate(dto.expiresAt, 'expiresAt')
+        : existing.expiresAt,
+    dishTypes: dto.dishTypes !== undefined ? dto.dishTypes : (existing.dishTypes as DishType[]),
+    category: existing.category,
   };
 }
 

@@ -7,14 +7,15 @@ import { DishType } from '@common/enums/dish-type.enum';
 import { Fulfillment } from '@common/enums/fulfillment.enum';
 import { SellerCategory } from '@common/enums/seller-category.enum';
 
-export class ListingAddOnResponseDto {
+/** Single extras row in the listing detail response. Internal model: `ListingAddOn`. */
+export class ListingExtraResponseDto {
   id!: string;
   label!: string;
   priceDeltaCents!: number;
   isSelectedByDefault!: boolean;
   sortOrder!: number;
 
-  static from(addOn: ListingAddOn): ListingAddOnResponseDto {
+  static from(addOn: ListingAddOn): ListingExtraResponseDto {
     return {
       id: addOn.id,
       label: addOn.label,
@@ -36,10 +37,12 @@ export class ListingResponseDto {
   originalPriceCents!: number | null;
   discountPercent!: number | null;
 
-  portionsLeft!: number;
+  // null = "cook to order" (restaurant/traiteur); the buyer UI shows
+  // "Disponible" instead of an N-portions count.
+  portionsLeft!: number | null;
 
-  cuisineType!: CuisineType | null;
-  dishType!: DishType | null;
+  cuisineTypes!: CuisineType[];
+  dishTypes!: DishType[];
   dietaryTags!: DietaryTag[];
   allergens!: Allergen[];
   otherAllergens!: string | null;
@@ -52,11 +55,12 @@ export class ListingResponseDto {
   fulfillment!: Fulfillment;
   prepMinutes!: number;
 
-  expiresAt!: Date;
+  // null = permanent menu item (restaurant/traiteur).
+  expiresAt!: Date | null;
   createdAt!: Date;
   updatedAt!: Date;
 
-  addOns!: ListingAddOnResponseDto[];
+  extras!: ListingExtraResponseDto[];
 
   static from(listing: Listing & { addOns: ListingAddOn[] }): ListingResponseDto {
     return {
@@ -69,8 +73,8 @@ export class ListingResponseDto {
       originalPriceCents: listing.originalPriceCents,
       discountPercent: listing.discountPercent,
       portionsLeft: listing.portionsLeft,
-      cuisineType: (listing.cuisineType as CuisineType | null) ?? null,
-      dishType: (listing.dishType as DishType | null) ?? null,
+      cuisineTypes: listing.cuisineTypes as CuisineType[],
+      dishTypes: listing.dishTypes as DishType[],
       dietaryTags: listing.dietaryTags as DietaryTag[],
       allergens: listing.allergens as Allergen[],
       otherAllergens: listing.otherAllergens,
@@ -83,10 +87,10 @@ export class ListingResponseDto {
       expiresAt: listing.expiresAt,
       createdAt: listing.createdAt,
       updatedAt: listing.updatedAt,
-      addOns: listing.addOns
+      extras: listing.addOns
         .slice()
         .sort((a, b) => a.sortOrder - b.sortOrder)
-        .map((a) => ListingAddOnResponseDto.from(a)),
+        .map((a) => ListingExtraResponseDto.from(a)),
     };
   }
 }

@@ -656,9 +656,11 @@ export class OrdersService {
       sellerId: string;
       name: string;
       priceCents: number;
-      portionsLeft: number;
+      // null = "cook to order" (restaurant/traiteur — no inventory tracking).
+      portionsLeft: number | null;
       isAvailable: boolean;
-      expiresAt: Date;
+      // null = permanent menu item (restaurant/traiteur — never expires).
+      expiresAt: Date | null;
       fulfillment: string;
       deletedAt: Date | null;
     }>;
@@ -722,7 +724,8 @@ export class OrdersService {
       if (!l.isAvailable) {
         throw new BadRequestException(`${l.name} is not available`);
       }
-      if (l.expiresAt.getTime() <= now) {
+      // null expiresAt = permanent menu item (restaurant/traiteur).
+      if (l.expiresAt !== null && l.expiresAt.getTime() <= now) {
         throw new BadRequestException(`${l.name} is no longer available`);
       }
     }

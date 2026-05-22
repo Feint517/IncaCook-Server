@@ -49,11 +49,23 @@ export class ListFeedQueryDto {
   @IsOptional() @IsEnum(SellerCategory)
   category?: SellerCategory;
 
-  @IsOptional() @IsEnum(CuisineType)
-  cuisineType?: CuisineType;
+  /**
+   * Listings whose `cuisineTypes` overlap ANY of these. CSV: `?cuisineTypes=ORIENTALE,ITALIENNE`.
+   * Empty / absent → no filter on cuisine.
+   */
+  @IsOptional()
+  @Transform(splitCsv)
+  @IsArray() @IsEnum(CuisineType, { each: true }) @ArrayUnique()
+  cuisineTypes?: CuisineType[];
 
-  @IsOptional() @IsEnum(DishType)
-  dishType?: DishType;
+  /**
+   * Listings whose `dishTypes` overlap ANY of these. CSV: `?dishTypes=PLAT,DESSERT`.
+   * Empty / absent → no filter on dish type.
+   */
+  @IsOptional()
+  @Transform(splitCsv)
+  @IsArray() @IsEnum(DishType, { each: true }) @ArrayUnique()
+  dishTypes?: DishType[];
 
   @IsOptional() @IsEnum(Fulfillment)
   fulfillment?: Fulfillment;

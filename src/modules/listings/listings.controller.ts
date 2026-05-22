@@ -61,17 +61,9 @@ export class ListingsController {
     };
   }
 
-  /** The authenticated seller's own listings (most recent first). */
-  @Get('me')
-  async mine(@CurrentUser() jwtUser: AuthenticatedUser): Promise<ListingResponseDto[]> {
-    const listings = await this.listings.findMine(jwtUser.id);
-    return listings.map((l) => ListingResponseDto.from(l));
-  }
-
   /**
-   * Public details — buyer feed will share this endpoint. The visibility
-   * gate (kycStatus = APPROVED) gets enforced when slice B wires up the
-   * feed; on the by-id endpoint we let any authenticated user fetch.
+   * Public details — buyer feed shares this endpoint. Sellers' own
+   * dashboard list lives on `GET /v1/sellers/me/listings`.
    */
   @Get(':id')
   async findById(@Param('id') id: string): Promise<ListingResponseDto> {
@@ -115,7 +107,7 @@ export class ListingsController {
  * `inRange` from distanceKm and the seller's deliveryRadiusKm. Aggregates
  * we don't have yet (rating, reviewCount) ship as null/0.
  */
-function toFeedListing(row: FeedRow): FeedListingResponseDto {
+export function toFeedListing(row: FeedRow): FeedListingResponseDto {
   const distanceKm = row.distanceKm;
   const inRange = distanceKm === null ? null : distanceKm <= row.sellerRadiusKm;
 
@@ -129,8 +121,8 @@ function toFeedListing(row: FeedRow): FeedListingResponseDto {
     originalPriceCents: row.originalPriceCents,
     discountPercent: row.discountPercent,
     portionsLeft: row.portionsLeft,
-    cuisineType: row.cuisineType as CuisineType | null,
-    dishType: row.dishType as DishType | null,
+    cuisineTypes: row.cuisineTypes as CuisineType[],
+    dishTypes: row.dishTypes as DishType[],
     dietaryTags: row.dietaryTags as DietaryTag[],
     allergens: row.allergens as Allergen[],
     otherAllergens: row.otherAllergens,
@@ -143,7 +135,7 @@ function toFeedListing(row: FeedRow): FeedListingResponseDto {
     expiresAt: row.expiresAt,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
-    addOns: [],
+    extras: [],
     sellerName: row.sellerName,
     distanceKm,
     inRange,

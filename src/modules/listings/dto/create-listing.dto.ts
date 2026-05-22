@@ -31,8 +31,10 @@ import { CreateListingAddOnDto } from './create-listing-add-on.dto';
  * Service-layer validations on top of these structural ones:
  *   - imageUrls.length <= 3 (also enforced by DB CHECK)
  *   - originalPriceCents >= priceCents (also enforced by DB CHECK)
- *   - expiresAt > now()
- *   - discountPercent and originalPriceCents internally consistent
+ *   - fait_maison sellers: priceCents <= 450, portionsLeft + expiresAt required
+ *   - expiresAt > now() when supplied
+ *
+ * Wire field `extras` maps to the internal `ListingAddOn` Prisma model.
  */
 export class CreateListingDto {
   @IsString() @MinLength(1) @MaxLength(200)
@@ -56,14 +58,16 @@ export class CreateListingDto {
   @IsOptional() @IsInt() @Min(0) @Max(100)
   discountPercent?: number;
 
-  @IsInt() @Min(0)
-  portionsLeft!: number;
+  // null = "cook to order" (restaurant/traiteur). Required for fait_maison —
+  // enforced server-side.
+  @IsOptional() @IsInt() @Min(0)
+  portionsLeft?: number;
 
-  @IsOptional() @IsEnum(CuisineType)
-  cuisineType?: CuisineType;
+  @IsOptional() @IsArray() @IsEnum(CuisineType, { each: true }) @ArrayUnique()
+  cuisineTypes?: CuisineType[];
 
-  @IsOptional() @IsEnum(DishType)
-  dishType?: DishType;
+  @IsOptional() @IsArray() @IsEnum(DishType, { each: true }) @ArrayUnique()
+  dishTypes?: DishType[];
 
   @IsOptional() @IsArray() @IsEnum(DietaryTag, { each: true }) @ArrayUnique()
   dietaryTags?: DietaryTag[];
@@ -89,13 +93,15 @@ export class CreateListingDto {
   @IsInt() @Min(0)
   prepMinutes!: number;
 
-  @IsDateString()
-  expiresAt!: string;
+  // null = permanent menu item (restaurant/traiteur). Required for fait_maison —
+  // enforced server-side.
+  @IsOptional() @IsDateString()
+  expiresAt?: string;
 
   @IsOptional()
   @IsArray()
-  @ArrayMaxSize(50)
+  @ArrayMaxSize(20)
   @ValidateNested({ each: true })
   @Type(() => CreateListingAddOnDto)
-  addOns?: CreateListingAddOnDto[];
+  extras?: CreateListingAddOnDto[];
 }

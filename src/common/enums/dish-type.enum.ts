@@ -3,4 +3,5 @@ export enum DishType {
   Plat = 'PLAT',
   Dessert = 'DESSERT',
   CocktailDinatoire = 'COCKTAIL_DINATOIRE',
+  Boisson = 'BOISSON',
 }

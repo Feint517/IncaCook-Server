@@ -300,8 +300,8 @@ async function main(): Promise<void> {
         category: 'FAIT_MAISON',
         fulfillment: 'BOTH',
         prepMinutes: 35,
-        cuisineType: 'ORIENTALE',
-        dishType: 'PLAT',
+        cuisineTypes: ['ORIENTALE'],
+        dishTypes: ['PLAT'],
         expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), // +7d
       },
       {
@@ -319,8 +319,8 @@ async function main(): Promise<void> {
         category: 'FAIT_MAISON',
         fulfillment: 'BOTH',
         prepMinutes: 15,
-        cuisineType: 'FRANCAISE',
-        dishType: 'PLAT',
+        cuisineTypes: ['FRANCAISE'],
+        dishTypes: ['PLAT'],
         expiresAt: new Date(Date.now() + 2 * 24 * 60 * 60 * 1000),
       },
       {
@@ -340,8 +340,8 @@ async function main(): Promise<void> {
         category: 'FAIT_MAISON',
         fulfillment: 'PICKUP',
         prepMinutes: 5,
-        cuisineType: 'FRANCAISE',
-        dishType: 'DESSERT',
+        cuisineTypes: ['FRANCAISE'],
+        dishTypes: ['DESSERT'],
         expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
       },
     ],

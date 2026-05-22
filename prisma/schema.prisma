@@ -102,6 +102,7 @@ enum DishType {
   PLAT
   DESSERT
   COCKTAIL_DINATOIRE
+  BOISSON
 }
 
 enum DayOfWeek {
@@ -588,12 +589,14 @@ model Listing {
   originalPriceCents Int? // pre-discount, when on promo
   discountPercent    Int? // 0–100; could be derived but stored for query perf
 
-  portionsLeft Int @default(1)
+  // null = "cook to order" (restaurant/traiteur). Required for fait_maison —
+  // enforced at the API layer (docs/posting-module.md §3.3).
+  portionsLeft Int?
 
-  // Per BACKEND_SCHEMA.md: each listing has at most one cuisine and one dish
-  // type. The kitchen's array of cuisines/dishes lives on SellerProfile.
-  cuisineType    CuisineType?
-  dishType       DishType?
+  // Each listing carries 0+ cuisines and 0+ dish types (multi-select form).
+  // See docs/posting-module.md §2.6.d.
+  cuisineTypes   CuisineType[] @default([])
+  dishTypes      DishType[]    @default([])
   dietaryTags    DietaryTag[] @default([])
   allergens      Allergen[]   @default([])
   // Free-text long-tail allergens (the 14-item enum doesn't cover everything).
@@ -617,8 +620,10 @@ model Listing {
   // prepMin/Max which describe the kitchen's overall range.
   prepMinutes Int
 
-  // Auto-hide from the buyer feed at this point.
-  expiresAt DateTime
+  // Auto-hide from the buyer feed at this point. null = permanent menu item
+  // (restaurant/traiteur). Required for fait_maison — enforced at the API
+  // layer (docs/posting-module.md §3.3).
+  expiresAt DateTime?
 
   deletedAt DateTime?
   createdAt DateTime  @default(now())
@@ -632,6 +637,8 @@ model Listing {
   @@index([isAvailable, expiresAt])
   @@index([category, isAvailable, expiresAt])
   @@index([deletedAt])
+  @@index([cuisineTypes], type: Gin)
+  @@index([dishTypes], type: Gin)
 }
 
 model ListingAddOn {
