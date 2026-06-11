@@ -5,8 +5,6 @@ import {
   InternalServerErrorException,
   NotFoundException,
 } from '@nestjs/common';
-import type { ConfigType } from '@nestjs/config';
-import type { KycDocument, User } from '@prisma/client';
 import { KycStatus } from '@prisma/client';
 
 import { UserRole } from '@common/enums/user-role.enum';
@@ -18,6 +16,9 @@ import { PrismaService } from '@infrastructure/database/prisma.service';
 import { SupabaseAdminService } from '@infrastructure/supabase/supabase-admin.service';
 
 import { ListAdminKycDocumentsQueryDto } from './dto/list-admin-kyc-documents.query.dto';
+
+import type { ConfigType } from '@nestjs/config';
+import type { KycDocument, User } from '@prisma/client';
 
 /** 15 minutes — long enough for a review session, short enough not to leak. */
 const SIGNED_URL_TTL_SECONDS = 15 * 60;
@@ -32,9 +33,7 @@ export interface ListResult {
 export interface DocumentDetail {
   document: KycDocument & {
     user: User & {
-      sellerProfile:
-        | { business: { siret: string; businessName: string } | null }
-        | null;
+      sellerProfile: { business: { siret: string; businessName: string } | null } | null;
     };
   };
   signedFileUrl: string;
@@ -213,9 +212,7 @@ export class AdminKycDocumentsService {
   private async signOrThrow(storedPath: string): Promise<string> {
     const bucket = this.cfg.buckets.kyc;
     const prefix = `${bucket}/`;
-    const objectPath = storedPath.startsWith(prefix)
-      ? storedPath.slice(prefix.length)
-      : storedPath;
+    const objectPath = storedPath.startsWith(prefix) ? storedPath.slice(prefix.length) : storedPath;
 
     const { data, error } = await this.supabase
       .storage(bucket)

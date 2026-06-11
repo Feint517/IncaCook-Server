@@ -6,6 +6,7 @@ import { databaseConfig } from './database.config';
 import { validateEnv } from './env.validation';
 import { firebaseConfig } from './firebase.config';
 import { mapboxConfig } from './mapbox.config';
+import { preludeConfig } from './prelude.config';
 import { redisConfig } from './redis.config';
 import { sentryConfig } from './sentry.config';
 import { stripeConfig } from './stripe.config';
@@ -25,6 +26,7 @@ import { twilioConfig } from './twilio.config';
         supabaseConfig,
         stripeConfig,
         twilioConfig,
+        preludeConfig,
         firebaseConfig,
         mapboxConfig,
         sentryConfig,

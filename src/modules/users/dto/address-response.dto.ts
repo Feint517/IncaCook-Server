@@ -1,6 +1,6 @@
-import type { Address } from '@prisma/client';
-
 import { SavedAddressType } from '@common/enums/saved-address-type.enum';
+
+import type { Address } from '@prisma/client';
 
 export class AddressResponseDto {
   id!: string;

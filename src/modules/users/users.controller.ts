@@ -1,4 +1,15 @@
-import { Body, Controller, Get, HttpCode, HttpStatus, Param, Post, Put } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Delete,
+  Get,
+  HttpCode,
+  HttpStatus,
+  Param,
+  Patch,
+  Post,
+  Put,
+} from '@nestjs/common';
 
 import { CurrentUser } from '@common/decorators/current-user.decorator';
 import type { AuthenticatedUser } from '@common/types/authenticated-request.type';
@@ -10,6 +21,7 @@ import { DriverProfileResponseDto } from './dto/driver-profile-response.dto';
 import { OpeningHoursResponseDto } from './dto/opening-hours-response.dto';
 import { RecordCharterDto } from './dto/record-charter.dto';
 import { SellerProfileResponseDto } from './dto/seller-profile-response.dto';
+import { UpdateUserDto } from './dto/update-user.dto';
 import { UpsertAddressDto } from './dto/upsert-address.dto';
 import { UserResponseDto } from './dto/user-response.dto';
 import { OnboardingStateDto } from './onboarding/dto/onboarding-state.dto';
@@ -54,10 +66,22 @@ export class UsersController {
    * new `next` step. See docs/signup-flow.md §4 for the derivation rules.
    */
   @Get('me/onboarding')
-  getOnboardingState(
-    @CurrentUser() jwtUser: AuthenticatedUser,
-  ): Promise<OnboardingStateDto> {
+  getOnboardingState(@CurrentUser() jwtUser: AuthenticatedUser): Promise<OnboardingStateDto> {
     return this.onboarding.getOnboardingState(jwtUser.id);
+  }
+
+  /**
+   * Edits the caller's profile basics — display name + avatar — for any
+   * role. Powers the in-app "Edit profile" screen. Returns the refreshed
+   * user so the client re-hydrates its cache.
+   */
+  @Patch('me')
+  async updateMe(
+    @CurrentUser() jwtUser: AuthenticatedUser,
+    @Body() dto: UpdateUserDto,
+  ): Promise<UserResponseDto> {
+    const aggregate = await this.users.updateProfile(jwtUser.id, dto);
+    return toUserResponse(aggregate);
   }
 
   /**
@@ -76,6 +100,45 @@ export class UsersController {
     const coords =
       dto.lat !== undefined && dto.lng !== undefined ? { lat: dto.lat, lng: dto.lng } : null;
     return AddressResponseDto.from(row, coords);
+  }
+
+  /** Lists all of the caller's saved addresses (newest first). */
+  @Get('me/addresses')
+  async listAddresses(@CurrentUser() jwtUser: AuthenticatedUser): Promise<AddressResponseDto[]> {
+    const rows = await this.users.listAddresses(jwtUser.id);
+    return rows.map((r) => AddressResponseDto.from(r.address, r.coords));
+  }
+
+  /** Creates a new saved address for the caller (kind derived from role). */
+  @Post('me/addresses')
+  @HttpCode(HttpStatus.CREATED)
+  async createAddress(
+    @CurrentUser() jwtUser: AuthenticatedUser,
+    @Body() dto: UpsertAddressDto,
+  ): Promise<AddressResponseDto> {
+    const { address, coords } = await this.users.createAddress(jwtUser.id, dto);
+    return AddressResponseDto.from(address, coords);
+  }
+
+  /** Updates one of the caller's saved addresses by id. */
+  @Patch('me/addresses/:id')
+  async updateAddress(
+    @CurrentUser() jwtUser: AuthenticatedUser,
+    @Param('id') id: string,
+    @Body() dto: UpsertAddressDto,
+  ): Promise<AddressResponseDto> {
+    const { address, coords } = await this.users.updateAddressById(jwtUser.id, id, dto);
+    return AddressResponseDto.from(address, coords);
+  }
+
+  /** Soft-deletes one of the caller's saved addresses by id. */
+  @Delete('me/addresses/:id')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  async deleteAddress(
+    @CurrentUser() jwtUser: AuthenticatedUser,
+    @Param('id') id: string,
+  ): Promise<void> {
+    await this.users.deleteAddressById(jwtUser.id, id);
   }
 
   /** Records the caller's acceptance of a versioned charter (CGU, CGV,

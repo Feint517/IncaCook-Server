@@ -1,22 +1,11 @@
-import {
-  Body,
-  Controller,
-  Get,
-  HttpCode,
-  HttpStatus,
-  Param,
-  Post,
-  Query,
-} from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, HttpStatus, Param, Post, Query } from '@nestjs/common';
 
 import { CurrentUser } from '@common/decorators/current-user.decorator';
 import type { AuthenticatedUser } from '@common/types/authenticated-request.type';
 
 import { DeliveriesService } from './deliveries.service';
-import {
-  DeliveryListResponseDto,
-  DeliveryResponseDto,
-} from './dto/delivery-response.dto';
+import { DeliveryListResponseDto, DeliveryResponseDto } from './dto/delivery-response.dto';
+import { DriverLocationDto } from './dto/driver-location.dto';
 import { ListDeliveriesQueryDto } from './dto/list-deliveries.query.dto';
 import { OnlineStatusDto } from './dto/online-status.dto';
 import { ReportIssueDto } from './dto/report-issue.dto';
@@ -43,6 +32,19 @@ export class DeliveriesController {
     await this.deliveries.setOnline(jwtUser.id, dto);
   }
 
+  /**
+   * High-frequency position update. Called every few seconds while a
+   * delivery is active. Persists last-known point and, when the driver
+   * is mid-delivery, fans out via Redis to the buyer's tracking socket.
+   */
+  @Post('drivers/me/location')
+  async pushLocation(
+    @CurrentUser() jwtUser: AuthenticatedUser,
+    @Body() dto: DriverLocationDto,
+  ): Promise<{ broadcast: boolean; deliveryId: string | null }> {
+    return this.deliveries.recordLocation(jwtUser.id, dto);
+  }
+
   /** Available SEARCHING deliveries for the driver to claim, FIFO. */
   @Get('drivers/me/deliveries/available')
   async listAvailable(
@@ -53,7 +55,7 @@ export class DeliveriesController {
     const offset = query.offset ?? 0;
     const result = await this.deliveries.listAvailable(jwtUser.id, limit, offset);
     return {
-      items: result.items.map((d) => DeliveryResponseDto.from(d)),
+      items: result.items.map(({ row, enrichment }) => DeliveryResponseDto.from(row, enrichment)),
       limit,
       offset,
       hasMore: result.hasMore,

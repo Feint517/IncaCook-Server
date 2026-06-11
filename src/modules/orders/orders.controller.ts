@@ -12,11 +12,10 @@ import {
 
 import { CurrentUser } from '@common/decorators/current-user.decorator';
 import { IdempotencyKey } from '@common/decorators/idempotency-key.decorator';
+import { IdempotencyService } from '@common/services/idempotency.service';
 import type { AuthenticatedUser } from '@common/types/authenticated-request.type';
 
 import { AddressResponseDto } from '@modules/users/dto/address-response.dto';
-
-import { IdempotencyService } from '@common/services/idempotency.service';
 
 import { CancelOrderDto } from './dto/cancel-order.dto';
 import { CreateOrderDto } from './dto/create-order.dto';
@@ -26,6 +25,7 @@ import {
   OrderListResponseDto,
   OrderResponseDto,
 } from './dto/order-response.dto';
+import { OrderTrackingResponseDto } from './dto/tracking-response.dto';
 import { OrdersService } from './orders.service';
 
 /**
@@ -68,17 +68,14 @@ export class OrdersController {
 
     const { order, paymentIntentClientSecret } = await this.orders.createOrder(jwtUser.id, dto);
     const response: CreateOrderResponseDto = {
-      order: OrderResponseDto.from(order, AddressResponseDto.from(order.dropoffAddress, null)),
+      order: OrderResponseDto.from(
+        order,
+        order.dropoffAddress ? AddressResponseDto.from(order.dropoffAddress, null) : null,
+      ),
       paymentIntentClientSecret,
     };
 
-    await this.idempotency.save(
-      jwtUser.id,
-      idempotencyKey,
-      dto,
-      HttpStatus.CREATED,
-      response,
-    );
+    await this.idempotency.save(jwtUser.id, idempotencyKey, dto, HttpStatus.CREATED, response);
 
     return response;
   }
@@ -94,7 +91,10 @@ export class OrdersController {
     const result = await this.orders.listForBuyer(jwtUser.id, query.status, limit, offset);
     return {
       items: result.items.map((o) =>
-        OrderResponseDto.from(o, AddressResponseDto.from(o.dropoffAddress, null)),
+        OrderResponseDto.from(
+          o,
+          o.dropoffAddress ? AddressResponseDto.from(o.dropoffAddress, null) : null,
+        ),
       ),
       limit,
       offset,
@@ -113,7 +113,10 @@ export class OrdersController {
     const result = await this.orders.listForSeller(jwtUser.id, query.status, limit, offset);
     return {
       items: result.items.map((o) =>
-        OrderResponseDto.from(o, AddressResponseDto.from(o.dropoffAddress, null)),
+        OrderResponseDto.from(
+          o,
+          o.dropoffAddress ? AddressResponseDto.from(o.dropoffAddress, null) : null,
+        ),
       ),
       limit,
       offset,
@@ -133,7 +136,42 @@ export class OrdersController {
     @Param('id') id: string,
   ): Promise<OrderResponseDto> {
     const order = await this.orders.findById(jwtUser.id, id);
-    return OrderResponseDto.from(order, AddressResponseDto.from(order.dropoffAddress, null));
+    return OrderResponseDto.from(
+      order,
+      order.dropoffAddress ? AddressResponseDto.from(order.dropoffAddress, null) : null,
+    );
+  }
+
+  /**
+   * Live-tracking snapshot for the order's map — real pickup/dropoff/driver
+   * coordinates + statuses. Readable by the buyer, seller, or assigned
+   * driver. Live driver movement after this then streams over the
+   * `/tracking` socket; this just gives the initial frame + correct leg.
+   */
+  @Get('orders/:id/tracking')
+  async tracking(
+    @CurrentUser() jwtUser: AuthenticatedUser,
+    @Param('id') id: string,
+  ): Promise<OrderTrackingResponseDto> {
+    return this.orders.getTracking(jwtUser.id, id);
+  }
+
+  /**
+   * Buyer confirms their payment succeeded. The server re-verifies the
+   * PaymentIntent with Stripe and, only if it really succeeded, advances
+   * the order PENDING → CONFIRMED (so it reaches the seller). Idempotent.
+   */
+  @Post('orders/:id/confirm-payment')
+  @HttpCode(HttpStatus.OK)
+  async confirmPayment(
+    @CurrentUser() jwtUser: AuthenticatedUser,
+    @Param('id') id: string,
+  ): Promise<OrderResponseDto> {
+    const order = await this.orders.confirmPaymentForBuyer(jwtUser.id, id);
+    return OrderResponseDto.from(
+      order,
+      order.dropoffAddress ? AddressResponseDto.from(order.dropoffAddress, null) : null,
+    );
   }
 
   // -------------------------------------------------------------------
@@ -148,7 +186,10 @@ export class OrdersController {
     @Param('id') id: string,
   ): Promise<OrderResponseDto> {
     const order = await this.orders.startPreparing(jwtUser.id, id);
-    return OrderResponseDto.from(order, AddressResponseDto.from(order.dropoffAddress, null));
+    return OrderResponseDto.from(
+      order,
+      order.dropoffAddress ? AddressResponseDto.from(order.dropoffAddress, null) : null,
+    );
   }
 
   /** PREPARING → READY. Food is ready for pickup or driver dispatch. */
@@ -159,7 +200,10 @@ export class OrdersController {
     @Param('id') id: string,
   ): Promise<OrderResponseDto> {
     const order = await this.orders.markReady(jwtUser.id, id);
-    return OrderResponseDto.from(order, AddressResponseDto.from(order.dropoffAddress, null));
+    return OrderResponseDto.from(
+      order,
+      order.dropoffAddress ? AddressResponseDto.from(order.dropoffAddress, null) : null,
+    );
   }
 
   /**
@@ -173,7 +217,10 @@ export class OrdersController {
     @Param('id') id: string,
   ): Promise<OrderResponseDto> {
     const order = await this.orders.confirmPickup(jwtUser.id, id);
-    return OrderResponseDto.from(order, AddressResponseDto.from(order.dropoffAddress, null));
+    return OrderResponseDto.from(
+      order,
+      order.dropoffAddress ? AddressResponseDto.from(order.dropoffAddress, null) : null,
+    );
   }
 
   /**
@@ -189,6 +236,9 @@ export class OrdersController {
     @Body() dto: CancelOrderDto,
   ): Promise<OrderResponseDto> {
     const order = await this.orders.cancelAsSeller(jwtUser.id, id, dto.reason);
-    return OrderResponseDto.from(order, AddressResponseDto.from(order.dropoffAddress, null));
+    return OrderResponseDto.from(
+      order,
+      order.dropoffAddress ? AddressResponseDto.from(order.dropoffAddress, null) : null,
+    );
   }
 }

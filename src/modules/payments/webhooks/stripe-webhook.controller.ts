@@ -8,14 +8,15 @@ import {
   Post,
   Req,
 } from '@nestjs/common';
-import type { RawBodyRequest } from '@nestjs/common';
-import type { Request } from 'express';
 
 import { Public } from '@common/decorators/public.decorator';
 
 import { StripeWebhookService } from '@infrastructure/stripe/stripe-webhook.service';
 
 import { StripeWebhookHandlerService } from './stripe-webhook-handler.service';
+
+import type { RawBodyRequest } from '@nestjs/common';
+import type { Request } from 'express';
 
 @Controller({ path: 'stripe/webhook', version: '1' })
 export class StripeWebhookController {

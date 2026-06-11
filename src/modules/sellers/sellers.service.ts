@@ -4,15 +4,9 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import type {
-  CuisineType,
-  DayOfWeek,
-  DishType,
-  SellerBusiness,
-  SellerProfile,
-} from '@prisma/client';
 import { SellerCategory } from '@prisma/client';
 
+import { maxRadiusForCategory } from '@common/constants/seller-radius.constants';
 import { UserRole } from '@common/enums/user-role.enum';
 
 import { PrismaService } from '@infrastructure/database/prisma.service';
@@ -20,6 +14,22 @@ import { PrismaService } from '@infrastructure/database/prisma.service';
 import { UpsertSellerBusinessDto } from './dto/upsert-seller-business.dto';
 import { UpsertSellerCuisinesDto } from './dto/upsert-seller-cuisines.dto';
 import { UpsertSellerProfileDto } from './dto/upsert-seller-profile.dto';
+
+import type {
+  CuisineType,
+  DayOfWeek,
+  DishType,
+  SellerBusiness,
+  SellerProfile,
+} from '@prisma/client';
+
+/**
+ * Fixed platform delivery fee (€2.50 TTC) applied to all seller categories
+ * per the client spec. Sellers don't set this during onboarding (yet), so we
+ * default it here whenever the profile is upserted without a value — this is
+ * what lets orders pass the `deliveryFeeCents !== null` gate in OrdersService.
+ */
+const DEFAULT_DELIVERY_FEE_CENTS = 250;
 
 @Injectable()
 export class SellersService {
@@ -37,6 +47,18 @@ export class SellersService {
       dto.prepMaxMinutes < dto.prepMinMinutes
     ) {
       throw new BadRequestException('prepMaxMinutes must be >= prepMinMinutes');
+    }
+
+    // Category-specific delivery-radius cap (Traiteur 50 km; fait-maison /
+    // restaurant 10 km). The seller is explicitly configuring here, so we
+    // REJECT an over-cap value with a clear message rather than silently
+    // clamping. Only validated when a radius is actually supplied — the
+    // onboarding flow omits it (defaults to null), so this is purely an
+    // API-misuse guard and never breaks normal signup.
+    if (dto.deliveryRadiusKm != null && dto.deliveryRadiusKm > maxRadiusForCategory(dto.category)) {
+      throw new BadRequestException(
+        `deliveryRadiusKm dépasse le maximum autorisé (${maxRadiusForCategory(dto.category)} km) pour cette catégorie.`,
+      );
     }
 
     // FAIT_MAISON auto-approves KYC; everyone else stays PENDING until
@@ -62,7 +84,9 @@ export class SellersService {
         dateOfBirth: new Date(dto.dateOfBirth),
         neighborhood: dto.neighborhood ?? null,
         deliveryRadiusKm: dto.deliveryRadiusKm ?? null,
-        deliveryFeeCents: dto.deliveryFeeCents ?? null,
+        // Fixed €2.50 fee for every category; default it when the client
+        // omits it so the seller can immediately receive orders.
+        deliveryFeeCents: dto.deliveryFeeCents ?? DEFAULT_DELIVERY_FEE_CENTS,
         prepMinMinutes: dto.prepMinMinutes ?? null,
         prepMaxMinutes: dto.prepMaxMinutes ?? null,
         hygieneCommitment: dto.hygieneCommitment ?? null,
@@ -77,7 +101,11 @@ export class SellersService {
   async upsertBusiness(
     supabaseId: string,
     dto: UpsertSellerBusinessDto,
-  ): Promise<SellerBusiness & { openingHours: Array<{ dayOfWeek: DayOfWeek; startTime: Date; endTime: Date }> }> {
+  ): Promise<
+    SellerBusiness & {
+      openingHours: Array<{ dayOfWeek: DayOfWeek; startTime: Date; endTime: Date }>;
+    }
+  > {
     const userId = await this.assertSeller(supabaseId);
 
     // Block business setup for fait-maison sellers — they're the only role

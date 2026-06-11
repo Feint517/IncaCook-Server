@@ -3,6 +3,7 @@ import {
   ArrayMaxSize,
   ArrayMinSize,
   IsArray,
+  IsBoolean,
   IsDateString,
   IsEnum,
   IsOptional,
@@ -41,7 +42,8 @@ export class CreateOrderDto {
   @IsEnum(FulfillmentChoice)
   fulfillmentChoice!: FulfillmentChoice;
 
-  @IsOptional() @IsString()
+  @IsOptional()
+  @IsString()
   dropoffAddressId?: string;
 
   @IsOptional()
@@ -49,16 +51,31 @@ export class CreateOrderDto {
   @Type(() => CreateAddressDto)
   dropoffAddress?: CreateAddressDto;
 
-  @IsOptional() @IsString() @MaxLength(500)
+  @IsOptional()
+  @IsString()
+  @MaxLength(500)
   deliveryInstructions?: string;
 
-  @IsOptional() @IsEnum(DeliveryTiming)
+  @IsOptional()
+  @IsEnum(DeliveryTiming)
   deliveryTiming?: DeliveryTiming;
 
   /** Required iff deliveryTiming = SCHEDULED. */
-  @IsOptional() @IsDateString()
+  @IsOptional()
+  @IsDateString()
   scheduledAt?: string;
 
-  @IsOptional() @IsString() @MaxLength(500)
+  @IsOptional()
+  @IsString()
+  @MaxLength(500)
   note?: string;
+
+  /**
+   * Buyer's CGU/CGV consent at purchase. Transient (validation-only — the
+   * durable consent record is a UserCharter row). The service rejects the
+   * order unless this is `true`.
+   */
+  @IsOptional()
+  @IsBoolean()
+  termsAccepted?: boolean;
 }

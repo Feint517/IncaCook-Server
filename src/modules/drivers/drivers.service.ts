@@ -4,7 +4,6 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import type { DriverProfile } from '@prisma/client';
 
 import { UserRole } from '@common/enums/user-role.enum';
 
@@ -12,6 +11,8 @@ import { PrismaService } from '@infrastructure/database/prisma.service';
 
 import { UpsertDriverVehicleDto } from './dto/upsert-vehicle.dto';
 import { UpsertDriverZonesDto } from './dto/upsert-zones.dto';
+
+import type { DriverProfile } from '@prisma/client';
 
 @Injectable()
 export class DriversService {

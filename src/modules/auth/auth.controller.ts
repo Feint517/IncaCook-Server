@@ -8,6 +8,7 @@ import {
   Post,
   Query,
 } from '@nestjs/common';
+import { Throttle } from '@nestjs/throttler';
 
 import { CurrentUser } from '@common/decorators/current-user.decorator';
 import { Public } from '@common/decorators/public.decorator';
@@ -15,6 +16,7 @@ import type { AuthenticatedUser } from '@common/types/authenticated-request.type
 
 import { AuthService } from './auth.service';
 import { GoogleSignInDto } from './dto/google-sign-in.dto';
+import { PhoneVerifyResponseDto } from './dto/phone-verify-response.dto';
 import { RefreshSessionDto } from './dto/refresh-session.dto';
 import { RequestPasswordResetDto } from './dto/request-password-reset.dto';
 import { RequestPhoneOtpDto } from './dto/request-phone-otp.dto';
@@ -24,6 +26,7 @@ import { SignUpDto } from './dto/sign-up.dto';
 import { UpdatePasswordDto } from './dto/update-password.dto';
 import { VerifyEmailOtpDto } from './dto/verify-email-otp.dto';
 import { VerifyPhoneOtpDto } from './dto/verify-phone-otp.dto';
+import { VerifyResetOtpDto } from './dto/verify-reset-otp.dto';
 
 @Controller({ path: 'auth', version: '1' })
 export class AuthController {
@@ -80,11 +83,30 @@ export class AuthController {
     await this.auth.signOut(token, resolvedScope);
   }
 
+  /**
+   * Starts the forgot-password flow. If the email belongs to a real account,
+   * Supabase emails a 6-digit recovery code (no link — see the recovery email
+   * template using `{{ .Token }}`). The response is intentionally generic so
+   * it never reveals whether the email is registered.
+   */
   @Public()
   @Post('password/reset-request')
-  @HttpCode(HttpStatus.NO_CONTENT)
-  resetRequest(@Body() dto: RequestPasswordResetDto): Promise<void> {
-    return this.auth.requestPasswordReset(dto.email, dto.redirectTo);
+  @HttpCode(HttpStatus.OK)
+  async resetRequest(@Body() dto: RequestPasswordResetDto): Promise<{ message: string }> {
+    await this.auth.requestPasswordReset(dto.email, dto.redirectTo);
+    return { message: 'If this email exists, a reset code has been sent.' };
+  }
+
+  /**
+   * Confirms the 6-digit reset code from the forgot-password email and returns
+   * a recovery session. The app then calls `password/update` with the returned
+   * `accessToken` as Bearer to set the new password.
+   */
+  @Public()
+  @Post('password/verify-reset-otp')
+  @HttpCode(HttpStatus.OK)
+  verifyResetOtp(@Body() dto: VerifyResetOtpDto): Promise<SessionResponseDto> {
+    return this.auth.verifyPasswordResetOtp(dto.email, dto.code);
   }
 
   /**
@@ -103,9 +125,8 @@ export class AuthController {
   }
 
   /**
-   * Temporary SMS bypass — sends a 6-digit code to the caller's own email
-   * (resolved from the JWT). Pair with POST /v1/auth/email/verify to flip
-   * `phoneVerified` without an SMS. Delete once the phone provider is back.
+   * Sends a 6-digit verification code to the caller's own email (resolved
+   * from the JWT, never the body). Pair with POST /v1/auth/email/verify.
    */
   @Post('email/request-otp')
   @HttpCode(HttpStatus.NO_CONTENT)
@@ -117,8 +138,8 @@ export class AuthController {
   }
 
   /**
-   * Confirms the email OTP. On success we set `User.phoneVerified = true`
-   * (the actual bypass) and return a fresh session minted by Supabase.
+   * Confirms the email OTP. On success we set `User.emailVerified = true`
+   * and return a fresh session minted by Supabase.
    */
   @Post('email/verify')
   @HttpCode(HttpStatus.OK)
@@ -133,33 +154,32 @@ export class AuthController {
   }
 
   /**
-   * Attaches a phone to the caller's existing email-based account and
-   * triggers an SMS OTP (or the local test_otp map). Idempotent —
-   * calling again with the same phone re-sends; calling with a different
-   * phone overwrites the pending one.
+   * Attaches a phone to the caller's account and sends an OTP via Prelude
+   * Verify. Idempotent — re-calling re-sends. Rate-limited to curb SMS abuse.
    */
   @Post('phone/request-otp')
+  @Throttle({ default: { limit: 5, ttl: 60_000 } })
   @HttpCode(HttpStatus.NO_CONTENT)
   async requestPhoneOtp(
-    @Headers('authorization') authHeader: string | undefined,
+    @CurrentUser() jwtUser: AuthenticatedUser,
     @Body() dto: RequestPhoneOtpDto,
   ): Promise<void> {
-    const token = extractBearer(authHeader);
-    await this.auth.requestPhoneOtp(token, dto.phone);
+    await this.auth.requestPhoneOtp(jwtUser.id, dto.phone);
   }
 
   /**
-   * Confirms the OTP. On success the user's phone is marked verified
-   * (both on Supabase and on our User row). Returns a fresh session.
+   * Confirms the OTP via Prelude. On success the user's phone is marked
+   * verified on our User row (no new session — the caller is already authed).
+   * Verify attempts are rate-limited.
    */
   @Post('phone/verify')
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
   @HttpCode(HttpStatus.OK)
   verifyPhoneOtp(
-    @Headers('authorization') authHeader: string | undefined,
+    @CurrentUser() jwtUser: AuthenticatedUser,
     @Body() dto: VerifyPhoneOtpDto,
-  ): Promise<SessionResponseDto> {
-    const token = extractBearer(authHeader);
-    return this.auth.verifyPhoneOtp(token, dto.phone, dto.code);
+  ): Promise<PhoneVerifyResponseDto> {
+    return this.auth.verifyPhoneOtp(jwtUser.id, dto.phone, dto.code);
   }
 }
 

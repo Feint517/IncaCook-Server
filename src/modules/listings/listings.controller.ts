@@ -11,13 +11,13 @@ import {
   Query,
 } from '@nestjs/common';
 
+import { CurrentUser } from '@common/decorators/current-user.decorator';
 import { Allergen } from '@common/enums/allergen.enum';
 import { CuisineType } from '@common/enums/cuisine-type.enum';
 import { DietaryTag } from '@common/enums/dietary-tag.enum';
 import { DishType } from '@common/enums/dish-type.enum';
 import { Fulfillment } from '@common/enums/fulfillment.enum';
 import { SellerCategory } from '@common/enums/seller-category.enum';
-import { CurrentUser } from '@common/decorators/current-user.decorator';
 import type { AuthenticatedUser } from '@common/types/authenticated-request.type';
 
 import { CreateListingDto } from './dto/create-listing.dto';
@@ -94,10 +94,7 @@ export class ListingsController {
 
   @Delete(':id')
   @HttpCode(HttpStatus.NO_CONTENT)
-  async remove(
-    @CurrentUser() jwtUser: AuthenticatedUser,
-    @Param('id') id: string,
-  ): Promise<void> {
+  async remove(@CurrentUser() jwtUser: AuthenticatedUser, @Param('id') id: string): Promise<void> {
     await this.listings.softDelete(jwtUser.id, id);
   }
 }
@@ -141,5 +138,7 @@ export function toFeedListing(row: FeedRow): FeedListingResponseDto {
     inRange,
     rating: row.rating,
     reviewCount: row.reviewCount,
+    lat: row.sellerLat ?? null,
+    lng: row.sellerLng ?? null,
   };
 }

@@ -2,22 +2,28 @@ import {
   BadRequestException,
   ForbiddenException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { AddressKind, DishType, KycStatus, Prisma, SellerCategory } from '@prisma/client';
-import type { Listing, ListingAddOn, SellerProfile } from '@prisma/client';
 
 import { ErrorCodes } from '@common/constants/error-codes.constants';
+import { maxRadiusForCategory } from '@common/constants/seller-radius.constants';
 import { UserRole } from '@common/enums/user-role.enum';
 import { BusinessRuleException } from '@common/exceptions/business-rule.exception';
 import { generateUlid } from '@common/utils/code-generator.util';
 
 import { PrismaService } from '@infrastructure/database/prisma.service';
 
+import { recordTermsAcceptance } from '@modules/compliance/charters/record-terms-acceptance.util';
+import { isSubscriptionActive } from '@modules/subscriptions/subscription.util';
+
 import { CreateListingAddOnDto } from './dto/create-listing-add-on.dto';
 import { CreateListingDto } from './dto/create-listing.dto';
 import { FeedSort, ListFeedQueryDto } from './dto/list-feed-query.dto';
 import { UpdateListingDto } from './dto/update-listing.dto';
+
+import type { Listing, ListingAddOn, SellerProfile } from '@prisma/client';
 
 type ListingWithAddOns = Listing & { addOns: ListingAddOn[] };
 type Tx = Prisma.TransactionClient;
@@ -83,6 +89,10 @@ export interface FeedRow {
   sellerName: string;
   sellerRadiusKm: number;
   distanceKm: number | null;
+  /** Seller pickup point (ST_Y/ST_X of SellerProfile.location). Null when the
+   *  seller has no geocoded location. Used for buyer map pins. */
+  sellerLat?: number | null;
+  sellerLng?: number | null;
   /** Cached on SellerProfile.averageRating; null when the seller has no reviews yet. */
   rating: number | null;
   /** Cached on SellerProfile.reviewCount. */
@@ -98,6 +108,8 @@ export interface FeedResult {
 
 @Injectable()
 export class ListingsService {
+  private readonly logger = new Logger(ListingsService.name);
+
   constructor(private readonly prisma: PrismaService) {}
 
   /**
@@ -107,7 +119,10 @@ export class ListingsService {
    */
   private async assertSeller(
     supabaseId: string,
-    opts: { requireKycApproved: boolean } = { requireKycApproved: false },
+    opts: {
+      requireKycApproved?: boolean;
+      requireActiveSubscription?: boolean;
+    } = {},
   ): Promise<{ sellerId: string; profile: SellerProfile }> {
     const user = await this.prisma.db.user.findUnique({
       where: { supabaseId },
@@ -122,17 +137,32 @@ export class ListingsService {
     if (opts.requireKycApproved && user.sellerProfile.kycStatus !== KycStatus.APPROVED) {
       throw new ForbiddenException('KYC_NOT_APPROVED');
     }
+    // Mandatory platform subscription gate — blocks add / edit / publish
+    // when the seller's $4/mo subscription isn't active.
+    if (
+      opts.requireActiveSubscription &&
+      !isSubscriptionActive(
+        user.sellerProfile.subscriptionStatus,
+        user.sellerProfile.subscriptionCurrentPeriodEnd,
+      )
+    ) {
+      throw new ForbiddenException('SUBSCRIPTION_INACTIVE');
+    }
     return { sellerId: user.id, profile: user.sellerProfile };
   }
 
   async create(supabaseId: string, dto: CreateListingDto): Promise<ListingWithAddOns> {
     const { sellerId, profile: seller } = await this.assertSeller(supabaseId, {
       requireKycApproved: true,
+      requireActiveSubscription: true,
     });
     if (!seller.category) {
-      throw new ForbiddenException(
-        'Complete your seller profile before creating listings',
-      );
+      throw new ForbiddenException('Complete your seller profile before creating listings');
+    }
+
+    // CGU/CGV must be explicitly accepted at each publication (client spec).
+    if (dto.termsAccepted !== true) {
+      throw new BadRequestException('Vous devez accepter les CGU/CGV avant de publier.');
     }
 
     const category = seller.category;
@@ -152,12 +182,13 @@ export class ListingsService {
       },
       category,
     );
+    validateAllergens(dto.allergens, dto.otherAllergens, dto.declaresNoAllergens);
 
     const expiresAt =
       dto.expiresAt !== undefined ? parseFutureDate(dto.expiresAt, 'expiresAt') : null;
 
     const id = generateUlid();
-    return this.prisma.$transaction(async (tx) => {
+    const created = await this.prisma.$transaction(async (tx) => {
       await tx.listing.create({
         data: {
           id,
@@ -191,6 +222,10 @@ export class ListingsService {
 
       return this.loadWithAddOns(tx, id);
     });
+
+    // Durable consent record (best-effort; never blocks a successful publish).
+    await recordTermsAcceptance(this.prisma, sellerId);
+    return created;
   }
 
   async findById(id: string): Promise<ListingWithAddOns> {
@@ -213,12 +248,11 @@ export class ListingsService {
     });
   }
 
-  async update(
-    supabaseId: string,
-    id: string,
-    dto: UpdateListingDto,
-  ): Promise<ListingWithAddOns> {
-    const { sellerId } = await this.assertSeller(supabaseId, { requireKycApproved: true });
+  async update(supabaseId: string, id: string, dto: UpdateListingDto): Promise<ListingWithAddOns> {
+    const { sellerId } = await this.assertSeller(supabaseId, {
+      requireKycApproved: true,
+      requireActiveSubscription: true,
+    });
 
     const existing = await this.prisma.db.listing.findUnique({ where: { id } });
     if (!existing || existing.deletedAt !== null) {
@@ -240,6 +274,13 @@ export class ListingsService {
         dishTypes: merged.dishTypes,
       },
       existing.category,
+    );
+    // Re-validate the merged allergen declaration so an update can't strip it
+    // below the publication floor.
+    validateAllergens(
+      dto.allergens ?? existing.allergens,
+      dto.otherAllergens ?? existing.otherAllergens,
+      dto.declaresNoAllergens,
     );
 
     const data: Prisma.ListingUpdateInput = {};
@@ -284,7 +325,10 @@ export class ListingsService {
     id: string,
     isAvailable: boolean,
   ): Promise<ListingWithAddOns> {
-    const { sellerId } = await this.assertSeller(supabaseId);
+    // Publishing / unpublishing is a seller feature — gate on subscription.
+    const { sellerId } = await this.assertSeller(supabaseId, {
+      requireActiveSubscription: true,
+    });
     const existing = await this.prisma.db.listing.findUnique({ where: { id } });
     if (!existing || existing.deletedAt !== null) {
       throw new NotFoundException('Listing not found');
@@ -332,13 +376,16 @@ export class ListingsService {
     const sort: FeedSort =
       query.sort === FeedSort.Distance && !buyerPoint
         ? FeedSort.Newest
-        : query.sort ?? (buyerPoint ? FeedSort.Distance : FeedSort.Newest);
+        : (query.sort ?? (buyerPoint ? FeedSort.Distance : FeedSort.Newest));
 
     const conditions: Prisma.Sql[] = [
       Prisma.sql`l."deletedAt" IS NULL`,
       Prisma.sql`l."isAvailable" = true`,
       Prisma.sql`(l."expiresAt" IS NULL OR l."expiresAt" > now())`,
       Prisma.sql`sp."kycStatus" = 'APPROVED'::"KycStatus"`,
+      // Only sellers with an active platform subscription appear in the feed.
+      Prisma.sql`sp."subscriptionStatus"::text IN ('ACTIVE', 'TRIALING')`,
+      Prisma.sql`(sp."subscriptionCurrentPeriodEnd" IS NULL OR sp."subscriptionCurrentPeriodEnd" > now())`,
       Prisma.sql`u."deletedAt" IS NULL`,
     ];
 
@@ -347,14 +394,10 @@ export class ListingsService {
     }
     if (query.cuisineTypes && query.cuisineTypes.length > 0) {
       // Array overlap — listing matches if ANY of its cuisines is in the query set.
-      conditions.push(
-        Prisma.sql`l."cuisineTypes" && ${query.cuisineTypes}::"CuisineType"[]`,
-      );
+      conditions.push(Prisma.sql`l."cuisineTypes" && ${query.cuisineTypes}::"CuisineType"[]`);
     }
     if (query.dishTypes && query.dishTypes.length > 0) {
-      conditions.push(
-        Prisma.sql`l."dishTypes" && ${query.dishTypes}::"DishType"[]`,
-      );
+      conditions.push(Prisma.sql`l."dishTypes" && ${query.dishTypes}::"DishType"[]`);
     }
     if (query.fulfillment) {
       conditions.push(Prisma.sql`l."fulfillment" = ${query.fulfillment}::"Fulfillment"`);
@@ -374,19 +417,31 @@ export class ListingsService {
     }
     if (query.avoidAllergens && query.avoidAllergens.length > 0) {
       // Exclude listings that share any allergen with the avoid set.
-      conditions.push(
-        Prisma.sql`NOT (l."allergens" && ${query.avoidAllergens}::"Allergen"[])`,
-      );
+      conditions.push(Prisma.sql`NOT (l."allergens" && ${query.avoidAllergens}::"Allergen"[])`);
     }
     if (query.search) {
       const pattern = `%${query.search}%`;
-      conditions.push(
-        Prisma.sql`(l."name" ILIKE ${pattern} OR l."description" ILIKE ${pattern})`,
-      );
+      conditions.push(Prisma.sql`(l."name" ILIKE ${pattern} OR l."description" ILIKE ${pattern})`);
+    }
+    if (query.inStockOnly) {
+      // Sold-out = portionsLeft 0. null portionsLeft (cook-to-order) is in stock.
+      conditions.push(Prisma.sql`(l."portionsLeft" IS NULL OR l."portionsLeft" > 0)`);
     }
 
     if (buyerPoint && query.maxDistanceKm !== undefined) {
-      const meters = query.maxDistanceKm * 1000;
+      // Backend is the source of truth for the category radius cap — the
+      // Flutter slider already clamps, but the API must protect against
+      // misuse. Clamp silently (better search UX than a 400) and log it.
+      // Cap: Traiteur 50 km; fait-maison / restaurant 10 km; no category 10.
+      const cap = maxRadiusForCategory(query.category);
+      const effectiveKm = Math.min(query.maxDistanceKm, cap);
+      if (effectiveKm < query.maxDistanceKm) {
+        this.logger.debug(
+          `[feed] maxDistanceKm ${query.maxDistanceKm} clamped to ${effectiveKm} km ` +
+            `(category=${query.category ?? 'ANY'})`,
+        );
+      }
+      const meters = effectiveKm * 1000;
       conditions.push(Prisma.sql`
         ST_DWithin(
           sp."location",
@@ -452,7 +507,9 @@ export class ListingsService {
         sp."deliveryRadiusKm"::float8 AS "sellerRadiusKm",
         sp."averageRating" AS "rating",
         sp."reviewCount" AS "reviewCount",
-        ${distanceSql} AS "distanceKm"
+        ${distanceSql} AS "distanceKm",
+        ST_Y(sp."location"::geometry)::float8 AS "sellerLat",
+        ST_X(sp."location"::geometry)::float8 AS "sellerLng"
       FROM "Listing" l
       JOIN "SellerProfile" sp ON sp."userId" = l."sellerId"
       JOIN "User" u ON u.id = sp."userId"
@@ -564,14 +621,10 @@ interface ListingShape {
 }
 
 function validateListingShape(s: ListingShape): void {
-  if (s.imageUrls && s.imageUrls.length > 3) {
-    throw new BadRequestException('imageUrls cannot have more than 3 entries');
+  if (s.imageUrls && s.imageUrls.length > 4) {
+    throw new BadRequestException('imageUrls cannot have more than 4 entries');
   }
-  if (
-    s.originalPriceCents != null &&
-    s.priceCents != null &&
-    s.originalPriceCents < s.priceCents
-  ) {
+  if (s.originalPriceCents != null && s.priceCents != null && s.originalPriceCents < s.priceCents) {
     throw new BadRequestException('originalPriceCents must be >= priceCents');
   }
 }
@@ -618,6 +671,34 @@ function validateCategoryShape(
             : ` — allowed: ${JSON.stringify(allowedList)}`),
       );
     }
+  }
+}
+
+/**
+ * Allergen declaration is mandatory at publication (food-safety / legal).
+ * A valid declaration is one of:
+ *   - at least one of the 14 EU allergens, OR
+ *   - an "Autres" free-text entry (otherAllergens, non-blank), OR
+ *   - an explicit "Aucun" (declaresNoAllergens) with no other allergen set.
+ */
+function validateAllergens(
+  allergens: readonly string[] | undefined,
+  otherAllergens: string | null | undefined,
+  declaresNone: boolean | undefined,
+): void {
+  const hasReal = (allergens?.length ?? 0) > 0;
+  const hasOther = typeof otherAllergens === 'string' && otherAllergens.trim().length > 0;
+
+  if (declaresNone) {
+    if (hasReal || hasOther) {
+      throw new BadRequestException('"Aucun" ne peut pas être combiné avec d\'autres allergènes');
+    }
+    return;
+  }
+  if (!hasReal && !hasOther) {
+    throw new BadRequestException(
+      'Déclarez au moins un allergène, "Autres" (avec précision), ou "Aucun"',
+    );
   }
 }
 

@@ -1,3 +1,4 @@
+import { SellerCategory } from '@prisma/client';
 import { Type } from 'class-transformer';
 import {
   IsDateString,
@@ -10,7 +11,6 @@ import {
   Min,
   MinLength,
 } from 'class-validator';
-import { SellerCategory } from '@prisma/client';
 
 /**
  * Body for `PUT /v1/sellers/me/profile`. Fills the seller-profile slice
@@ -25,33 +25,52 @@ export class UpsertSellerProfileDto {
   @IsEnum(SellerCategory)
   category!: SellerCategory;
 
-  @IsString() @MinLength(1) @MaxLength(120)
+  @IsString()
+  @MinLength(1)
+  @MaxLength(120)
   displayName!: string;
 
-  @IsOptional() @IsString() @MaxLength(2000)
+  @IsOptional()
+  @IsString()
+  @MaxLength(2000)
   bio?: string;
 
   /** Storage object key in `avatars/` — uploaded via Phase D's signed URL flow. */
-  @IsString() @MinLength(1) @MaxLength(500)
+  @IsString()
+  @MinLength(1)
+  @MaxLength(500)
   profilePhotoUrl!: string;
 
   /** ISO date YYYY-MM-DD. */
   @IsDateString()
   dateOfBirth!: string;
 
-  @IsOptional() @IsString() @MaxLength(120)
+  @IsOptional()
+  @IsString()
+  @MaxLength(120)
   neighborhood?: string;
 
-  @IsOptional() @IsNumber() @Min(0)
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
   deliveryRadiusKm?: number;
 
-  @IsOptional() @IsInt() @Min(0) @Type(() => Number)
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  @Type(() => Number)
   deliveryFeeCents?: number;
 
-  @IsOptional() @IsInt() @Min(0) @Type(() => Number)
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  @Type(() => Number)
   prepMinMinutes?: number;
 
-  @IsOptional() @IsInt() @Min(0) @Type(() => Number)
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  @Type(() => Number)
   prepMaxMinutes?: number;
 
   /** Hygiene charter is accepted via POST /v1/users/me/charters; these

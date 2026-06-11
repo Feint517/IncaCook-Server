@@ -33,7 +33,8 @@ export class CreateDriverProfileDto {
   @IsDateString()
   dateOfBirth!: string;
 
-  @ValidateNested() @Type(() => CreateAddressDto)
+  @ValidateNested()
+  @Type(() => CreateAddressDto)
   baseAddress!: CreateAddressDto;
 
   @IsEnum(DriverVehicleType)

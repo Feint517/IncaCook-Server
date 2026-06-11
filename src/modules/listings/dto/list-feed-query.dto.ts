@@ -46,7 +46,8 @@ const splitCsv = ({ value }: { value: unknown }): unknown => {
 
 /** Query params for `GET /v1/listings`. All optional. */
 export class ListFeedQueryDto {
-  @IsOptional() @IsEnum(SellerCategory)
+  @IsOptional()
+  @IsEnum(SellerCategory)
   category?: SellerCategory;
 
   /**
@@ -55,7 +56,9 @@ export class ListFeedQueryDto {
    */
   @IsOptional()
   @Transform(splitCsv)
-  @IsArray() @IsEnum(CuisineType, { each: true }) @ArrayUnique()
+  @IsArray()
+  @IsEnum(CuisineType, { each: true })
+  @ArrayUnique()
   cuisineTypes?: CuisineType[];
 
   /**
@@ -64,10 +67,13 @@ export class ListFeedQueryDto {
    */
   @IsOptional()
   @Transform(splitCsv)
-  @IsArray() @IsEnum(DishType, { each: true }) @ArrayUnique()
+  @IsArray()
+  @IsEnum(DishType, { each: true })
+  @ArrayUnique()
   dishTypes?: DishType[];
 
-  @IsOptional() @IsEnum(Fulfillment)
+  @IsOptional()
+  @IsEnum(Fulfillment)
   fulfillment?: Fulfillment;
 
   /**
@@ -75,7 +81,9 @@ export class ListFeedQueryDto {
    */
   @IsOptional()
   @Transform(splitCsv)
-  @IsArray() @IsEnum(DietaryTag, { each: true }) @ArrayUnique()
+  @IsArray()
+  @IsEnum(DietaryTag, { each: true })
+  @ArrayUnique()
   dietary?: DietaryTag[];
 
   /**
@@ -83,24 +91,48 @@ export class ListFeedQueryDto {
    */
   @IsOptional()
   @Transform(splitCsv)
-  @IsArray() @IsEnum(Allergen, { each: true }) @ArrayUnique()
+  @IsArray()
+  @IsEnum(Allergen, { each: true })
+  @ArrayUnique()
   avoidAllergens?: Allergen[];
 
-  @IsOptional() @IsBoolean()
+  @IsOptional()
+  @IsBoolean()
   isVeg?: boolean;
 
-  @IsOptional() @IsInt() @Min(0) @Type(() => Number)
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  @Type(() => Number)
   minPriceCents?: number;
 
-  @IsOptional() @IsInt() @Min(0) @Type(() => Number)
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  @Type(() => Number)
   maxPriceCents?: number;
 
   /** Hard cap distance in km. Requires buyer location to be present. */
-  @IsOptional() @IsNumber({ maxDecimalPlaces: 1 }) @Min(0) @Max(500) @Type(() => Number)
+  @IsOptional()
+  @IsNumber({ maxDecimalPlaces: 1 })
+  @Min(0)
+  @Max(500)
+  @Type(() => Number)
   maxDistanceKm?: number;
 
+  /**
+   * When true, hide listings that are sold out (`portionsLeft = 0`). A null
+   * `portionsLeft` (cook-to-order restaurant/traiteur) is always considered
+   * in stock. Defaults to off.
+   */
+  @IsOptional()
+  @IsBoolean()
+  inStockOnly?: boolean;
+
   /** ILIKE match on name + description. */
-  @IsOptional() @IsString() @MaxLength(120)
+  @IsOptional()
+  @IsString()
+  @MaxLength(120)
   search?: string;
 
   /**
@@ -108,18 +140,30 @@ export class ListFeedQueryDto {
    * address point. If neither resolves, the response has `distanceKm: null`
    * and distance-based sort/filter is disabled.
    */
-  @IsOptional() @IsLatitude() @Type(() => Number)
+  @IsOptional()
+  @IsLatitude()
+  @Type(() => Number)
   lat?: number;
 
-  @IsOptional() @IsLongitude() @Type(() => Number)
+  @IsOptional()
+  @IsLongitude()
+  @Type(() => Number)
   lng?: number;
 
-  @IsOptional() @IsEnum(FeedSort)
+  @IsOptional()
+  @IsEnum(FeedSort)
   sort?: FeedSort;
 
-  @IsOptional() @IsInt() @Min(1) @Max(100) @Type(() => Number)
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(100)
+  @Type(() => Number)
   limit?: number;
 
-  @IsOptional() @IsInt() @Min(0) @Type(() => Number)
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  @Type(() => Number)
   offset?: number;
 }

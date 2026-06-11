@@ -1,9 +1,9 @@
-import type { BuyerProfile } from '@prisma/client';
-
 import { Allergen } from '@common/enums/allergen.enum';
 import { DietaryTag } from '@common/enums/dietary-tag.enum';
 
 import { AddressResponseDto } from './address-response.dto';
+
+import type { BuyerProfile } from '@prisma/client';
 
 /**
  * Buyer slice of /v1/users/me. Field names match the request body of

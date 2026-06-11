@@ -21,4 +21,9 @@ export class FeedListingResponseDto extends ListingResponseDto {
   inRange!: boolean | null;
   rating!: number | null;
   reviewCount!: number;
+
+  /** Seller pickup coordinates for buyer-map pins. Null when the seller has
+   *  no geocoded location. Optional so non-feed mappers needn't set them. */
+  lat?: number | null;
+  lng?: number | null;
 }

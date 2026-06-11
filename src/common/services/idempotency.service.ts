@@ -48,9 +48,7 @@ export class IdempotencyService {
       return null;
     }
     if (existing.requestHash !== requestHash) {
-      throw new ConflictException(
-        'Idempotency-Key reused with a different request body',
-      );
+      throw new ConflictException('Idempotency-Key reused with a different request body');
     }
     return {
       status: existing.responseStatus,

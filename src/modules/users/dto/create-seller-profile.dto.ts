@@ -40,38 +40,54 @@ export class CreateSellerProfileDto {
   @IsEnum(SellerCategory)
   category!: SellerCategory;
 
-  @IsString() @MinLength(1) @MaxLength(120)
+  @IsString()
+  @MinLength(1)
+  @MaxLength(120)
   displayName!: string;
 
-  @IsOptional() @IsString() @MaxLength(2000)
+  @IsOptional()
+  @IsString()
+  @MaxLength(2000)
   bio?: string;
 
   // Storage object key in `avatars/`. Client uploads to Supabase Storage
   // first, then sends the path here.
-  @IsString() @MinLength(1)
+  @IsString()
+  @MinLength(1)
   profilePhotoUrl!: string;
 
   // ISO date (YYYY-MM-DD). Service strips time on insert (date column).
   @IsDateString()
   dateOfBirth!: string;
 
-  @ValidateNested() @Type(() => CreateAddressDto)
+  @ValidateNested()
+  @Type(() => CreateAddressDto)
   pickupAddress!: CreateAddressDto;
 
-  @IsOptional() @IsString() @MaxLength(200)
+  @IsOptional()
+  @IsString()
+  @MaxLength(200)
   businessName?: string;
 
   // 14-digit. Luhn validation done at the service layer.
-  @IsOptional() @IsString() @MaxLength(14)
+  @IsOptional()
+  @IsString()
+  @MaxLength(14)
   siret?: string;
 
-  @IsOptional() @IsString() @MinLength(1)
+  @IsOptional()
+  @IsString()
+  @MinLength(1)
   restaurantFacadeUrl?: string;
 
-  @IsArray() @IsEnum(CuisineType, { each: true }) @ArrayUnique()
+  @IsArray()
+  @IsEnum(CuisineType, { each: true })
+  @ArrayUnique()
   cuisineTypes!: CuisineType[];
 
-  @IsArray() @IsEnum(DishType, { each: true }) @ArrayUnique()
+  @IsArray()
+  @IsEnum(DishType, { each: true })
+  @ArrayUnique()
   dishTypes!: DishType[];
 
   @IsBoolean()
@@ -82,31 +98,47 @@ export class CreateSellerProfileDto {
 
   // numeric(4,1) — at most one decimal place; matches DB column.
   @IsNumber({ maxDecimalPlaces: 1 })
-  @Min(0) @Max(999.9)
+  @Min(0)
+  @Max(999.9)
   deliveryRadiusKm!: number;
 
-  @IsInt() @Min(0)
+  @IsInt()
+  @Min(0)
   deliveryFeeCents!: number;
 
-  @IsInt() @Min(0)
+  @IsInt()
+  @Min(0)
   prepMinMinutes!: number;
 
-  @IsInt() @Min(0)
+  @IsInt()
+  @Min(0)
   prepMaxMinutes!: number;
 
-  @IsString() @MinLength(1) @MaxLength(200)
+  @IsString()
+  @MinLength(1)
+  @MaxLength(200)
   neighborhood!: string;
 
-  @IsArray() @IsString({ each: true }) @ArrayMinSize(1) @ArrayMaxSize(20) @ArrayUnique()
+  @IsArray()
+  @IsString({ each: true })
+  @ArrayMinSize(1)
+  @ArrayMaxSize(20)
+  @ArrayUnique()
   languageCodes!: string[];
 
-  @IsOptional() @IsString() @MaxLength(500)
+  @IsOptional()
+  @IsString()
+  @MaxLength(500)
   availabilitySchedule?: string;
 
-  @IsOptional() @IsString() @MaxLength(200)
+  @IsOptional()
+  @IsString()
+  @MaxLength(200)
   promoText?: string;
 
-  @IsOptional() @IsString() @MaxLength(100)
+  @IsOptional()
+  @IsString()
+  @MaxLength(100)
   categoryTag?: string;
 
   // Empty array (or absent) for non-RESTAURANT categories. Required + non-empty

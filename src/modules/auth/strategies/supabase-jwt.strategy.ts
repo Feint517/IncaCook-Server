@@ -1,8 +1,8 @@
 import { Inject, Injectable, UnauthorizedException } from '@nestjs/common';
 import { ConfigType } from '@nestjs/config';
 import { PassportStrategy } from '@nestjs/passport';
-import { ExtractJwt, Strategy } from 'passport-jwt';
 import { JwksClient } from 'jwks-rsa';
+import { ExtractJwt, Strategy } from 'passport-jwt';
 
 import { UserRole } from '@common/enums/user-role.enum';
 import type { AuthenticatedUser } from '@common/types/authenticated-request.type';

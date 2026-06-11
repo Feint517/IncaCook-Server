@@ -1,6 +1,6 @@
-import type { KycDocType, KycDocument, KycStatus, User } from '@prisma/client';
-
 import { UserRole } from '@common/enums/user-role.enum';
+
+import type { KycDocType, KycDocument, KycStatus, User } from '@prisma/client';
 
 /**
  * Admin-side detail view of a single KYC document. `fileUrl` is a signed
@@ -34,9 +34,7 @@ export class AdminKycDocumentResponseDto {
   static from(
     doc: KycDocument & {
       user: User & {
-        sellerProfile:
-          | { business: { siret: string; businessName: string } | null }
-          | null;
+        sellerProfile: { business: { siret: string; businessName: string } | null } | null;
       };
     },
     signedFileUrl: string,

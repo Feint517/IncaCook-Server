@@ -257,6 +257,7 @@ model User {
   addresses     Address[]
 
   buyerOrders     Order[]          @relation("BuyerOrders")
+  catalogOrders   CatalogOrder[]   @relation("SellerCatalogOrders")
   auditLogs       AuditLog[]
   idempotencyKeys IdempotencyKey[]
 
@@ -268,8 +269,47 @@ model User {
   reviewsAuthored Review[]   @relation("ReviewAuthor")
   bookmarks       Bookmark[]
 
+  // Chat — see Conversation / ConversationParticipant / Message.
+  chatParticipations ConversationParticipant[] @relation("ConversationParticipantUser")
+  chatMessages       Message[]                 @relation("MessageSender")
+
+  // FCM push-notification registration tokens (one row per device token).
+  deviceTokens DeviceToken[]
+
   @@index([role])
   @@index([deletedAt])
+}
+
+/// An FCM registration token for one of a user's devices. `token` is unique,
+/// so re-registering an existing token re-points it at the current user and
+/// refreshes `updatedAt` instead of creating a duplicate
+/// (see DeviceTokensService.register). `platform` holds 'ANDROID' | 'IOS' |
+/// 'WEB', validated at the DTO layer (RegisterDeviceTokenDto).
+model DeviceToken {
+  id       String @id
+  token    String @unique
+  platform String
+  userId   String
+  user     User   @relation(fields: [userId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+}
+
+/// Seller platform-subscription state, mirrored from Stripe by the
+/// subscription webhooks. NONE = never subscribed. Seller features are
+/// gated on ACTIVE/TRIALING (with a valid current-period-end).
+enum SubscriptionStatus {
+  NONE
+  ACTIVE
+  TRIALING
+  PAST_DUE
+  CANCELED
+  UNPAID
+  INCOMPLETE
+  INCOMPLETE_EXPIRED
 }
 
 model SellerProfile {
@@ -348,6 +388,17 @@ model SellerProfile {
   totalOrders   Int     @default(0)
   averageRating Float?
   reviewCount   Int     @default(0)
+
+  // Mandatory monthly platform subscription ($4/mo). The seller cannot use
+  // seller features (list/edit/publish products, receive orders, appear in
+  // the feed) until this is active. Stripe is the source of truth — these
+  // columns are written by the subscription webhooks. The Stripe customer
+  // is the same one stored on User.stripeCustomerId.
+  stripeSubscriptionId         String?            @unique
+  subscriptionStatus           SubscriptionStatus @default(NONE)
+  // End of the current paid period ("subscriptionExpiresAt"). Active when
+  // status ∈ {ACTIVE, TRIALING} AND this is in the future.
+  subscriptionCurrentPeriodEnd DateTime?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -706,8 +757,10 @@ model Order {
   fulfillmentChoice FulfillmentChoice
 
   // Drop-off — full Address row (so we get postal_code, lat/lng, etc.).
-  dropoffAddressId     String
-  dropoffAddress       Address @relation("OrderDropoff", fields: [dropoffAddressId], references: [id])
+  // Null for PICKUP orders: the buyer collects from the seller, so there
+  // is no delivery address.
+  dropoffAddressId     String?
+  dropoffAddress       Address? @relation("OrderDropoff", fields: [dropoffAddressId], references: [id])
   deliveryInstructions String?
 
   // Scheduling.
@@ -753,9 +806,10 @@ model Order {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  items      OrderItem[]
-  deliveries Delivery[]
-  review     Review?
+  items         OrderItem[]
+  deliveries    Delivery[]
+  review        Review?
+  conversations Conversation[] @relation("ConversationOrder")
 
   @@index([buyerId, createdAt(sort: Desc)])
   @@index([sellerId, createdAt(sort: Desc)])
@@ -958,4 +1012,280 @@ model IdempotencyKey {
 
   @@unique([userId, key])
   @@index([expiresAt]) // cleanup sweep
+}
+
+// ---------------------------------------------------------------------------
+// Chat — reusable conversation system shared across buyer↔seller,
+// buyer↔delivery, and support threads. Persisted (vs the earlier
+// ephemeral Redis-pubsub chat) so history survives app restart and
+// unread counts can be tracked per participant.
+// ---------------------------------------------------------------------------
+
+enum ConversationType {
+  BUYER_SELLER
+  BUYER_DELIVERY
+  SUPPORT
+}
+
+enum ParticipantRole {
+  BUYER
+  SELLER
+  DELIVERY
+  SUPPORT
+}
+
+enum MessageType {
+  TEXT
+  IMAGE
+  SYSTEM
+}
+
+model Conversation {
+  id   String           @id
+  type ConversationType
+
+  // Optional foreign keys. A BUYER_SELLER conversation may pin to a
+  // store; a BUYER_DELIVERY conversation always pins to the order
+  // that spawned it (one delivery thread per order, per assignee).
+  orderId String?
+  order   Order?  @relation("ConversationOrder", fields: [orderId], references: [id])
+  storeId String?
+
+  // Denormalized last-message snapshot for list views. Kept in sync
+  // by MessagesService on every send.
+  lastMessage   String?
+  lastMessageAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  participants ConversationParticipant[]
+  messages     Message[]
+
+  // Find-or-create matches against (type, orderId, sorted participants).
+  // For BUYER_SELLER without an order, the (type, storeId/null) pair
+  // collapses to "one thread per buyer×seller" via service-layer dedup.
+  @@index([type, orderId])
+  @@index([lastMessageAt(sort: Desc)])
+}
+
+model ConversationParticipant {
+  id             String       @id
+  conversationId String
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  userId String
+  user   User   @relation("ConversationParticipantUser", fields: [userId], references: [id], onDelete: Cascade)
+
+  role ParticipantRole
+
+  // Per-user unread counter (incremented when ANOTHER participant
+  // posts; reset to 0 by markRead). Avoids a Set-of-read-message-ids
+  // table and is enough for the badge UX.
+  unreadCount Int       @default(0)
+  lastReadAt  DateTime?
+
+  joinedAt DateTime @default(now())
+
+  @@unique([conversationId, userId])
+  @@index([userId, conversationId])
+}
+
+model Message {
+  id             String       @id
+  conversationId String
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  senderId String
+  sender   User   @relation("MessageSender", fields: [senderId], references: [id], onDelete: Cascade)
+
+  content     String
+  messageType MessageType @default(TEXT)
+
+  // Read by the OTHER participant. Optional because group threads
+  // (SUPPORT) could have more than two readers; for 1:1 threads this
+  // is the moment the counterpart opened the conversation. Currently
+  // tracked at the participant level via `lastReadAt`; this field
+  // stays nullable for future per-message receipts.
+  readAt DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@index([conversationId, createdAt(sort: Desc)])
+}
+
+// ---------------------------------------------------------------------------
+// Admin product catalog — products created by admins and sold TO sellers.
+// Visible only to SELLER role (enforced in the catalog controller). Distinct
+// from Listing (a seller's own dishes sold to buyers).
+// ---------------------------------------------------------------------------
+
+enum CatalogOrderStatus {
+  PENDING // created, awaiting payment
+  PAID // seller's card charged
+  FAILED // payment failed
+  CANCELLED
+}
+
+model CatalogProduct {
+  id          String   @id
+  name        String
+  description String?
+  imageUrls   String[] @default([])
+  priceCents  Int
+  currency    String   @default("usd")
+  isActive    Boolean  @default(true)
+
+  // Admin (User with role ADMIN/MODERATOR) who created the product.
+  // Nullable so admin deletion doesn't cascade-delete catalog rows.
+  createdById String?
+
+  deletedAt DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  orderItems CatalogOrderItem[]
+
+  @@index([isActive])
+  @@index([deletedAt])
+}
+
+model CatalogOrder {
+  id       String             @id
+  sellerId String
+  seller   User               @relation("SellerCatalogOrders", fields: [sellerId], references: [id])
+  status   CatalogOrderStatus @default(PENDING)
+
+  totalCents Int
+  currency   String @default("usd")
+
+  // Stripe is the source of truth for PAID (confirm-payment + webhook).
+  stripePaymentIntentId String? @unique
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  paidAt    DateTime?
+
+  items CatalogOrderItem[]
+
+  @@index([sellerId])
+  @@index([status])
+}
+
+model CatalogOrderItem {
+  id      String       @id
+  orderId String
+  order   CatalogOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  // Product reference kept nullable + snapshotted so price/name on the
+  // order are stable even if the product is later edited or deleted.
+  productId String?
+  product   CatalogProduct? @relation(fields: [productId], references: [id])
+
+  nameSnapshot   String
+  unitPriceCents Int
+  quantity       Int
+  lineTotalCents Int
+
+  @@index([orderId])
+}
+
+// ---------------------------------------------------------------------------
+// Moderation — user-submitted reports reviewed by admins. Maps to the
+// pre-existing (empty) `Report` table: polymorphic target (targetType +
+// targetId) + a `reason` enum (the report TYPE) + free-text `description`.
+// NON_FAIT_MAISON / MAUVAISE_HYGIENE were added additively to ReportReason,
+// and REJECTED to ReportStatus.
+// ---------------------------------------------------------------------------
+
+enum ReportReason {
+  // Generic content-moderation reasons (pre-existing).
+  SPAM
+  INAPPROPRIATE
+  OFFENSIVE
+  FAKE
+  DUPLICATE
+  // Client-spec report types:
+  //   NON_FAIT_MAISON  — a "Le Bon Fait Maison" dish that isn't home-made
+  //                      (only valid for FAIT_MAISON listings — service-enforced).
+  //   MAUVAISE_HYGIENE — hygiene concern (any seller category).
+  NON_FAIT_MAISON
+  MAUVAISE_HYGIENE
+  OTHER
+}
+
+enum ReportStatus {
+  PENDING
+  DISMISSED // legacy; unused by the new flow
+  RESOLVED
+  REJECTED
+}
+
+model Report {
+  id          String       @id
+  reporterId  String
+  // Polymorphic target. targetType: 'LISTING' | 'SELLER'; targetId is the
+  // Listing.id or seller User.id.
+  targetType  String
+  targetId    String
+  // The report TYPE (exposed as `type` in the API).
+  reason      ReportReason
+  // Optional free-text comment from the reporter.
+  description String?
+  status      ReportStatus @default(PENDING)
+  // Admin reviewer (User.id) + note, set on resolve/reject.
+  reviewedBy  String?
+  adminNote   String?
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  @@index([status, createdAt(sort: Desc)])
+  // Duplicate-spam guard: same reporter + target + type while PENDING.
+  @@index([reporterId, targetId, reason, status])
+}
+
+// ---------------------------------------------------------------------------
+// Internal wallet ledger. Sellers/drivers are credited here when an order is
+// delivered + reception-validated (never on payment). Real Stripe transfers
+// to their Connect account happen only on withdrawal (balance >= 50 €).
+// ---------------------------------------------------------------------------
+
+enum WalletEntryType {
+  ORDER_EARNING // seller net (subtotal - commission)
+  DELIVERY_EARNING // driver delivery fee
+  COMMISSION // platform cut (recorded under userId='PLATFORM')
+  REFUND
+  WITHDRAWAL // payout debit
+}
+
+enum WalletEntryStatus {
+  PENDING
+  AVAILABLE
+  HELD // disputed / CGU-CGV violation — not payable
+  PAID_OUT
+  CANCELLED
+}
+
+model WalletEntry {
+  id           String            @id
+  // Beneficiary User.id (seller or driver); 'PLATFORM' for COMMISSION rows.
+  userId       String
+  orderId      String?
+  type         WalletEntryType
+  // Positive = credit; negative = debit (WITHDRAWAL).
+  amountCents  Int
+  currency     String            @default("eur")
+  status       WalletEntryStatus @default(AVAILABLE)
+  // Groups a payout: the WITHDRAWAL debit + the entries it paid out.
+  withdrawalId String?
+  availableAt  DateTime?
+  metadata     Json?
+  createdAt    DateTime          @default(now())
+  updatedAt    DateTime          @updatedAt
+
+  // Idempotency: one earning/commission row per (order, user, type). Payout
+  // rows have orderId=null (Postgres treats NULLs as distinct → many allowed).
+  @@unique([orderId, userId, type])
+  @@index([userId, status])
+  @@index([orderId])
 }

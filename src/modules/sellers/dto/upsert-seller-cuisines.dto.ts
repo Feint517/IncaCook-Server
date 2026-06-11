@@ -1,5 +1,5 @@
-import { ArrayMinSize, ArrayUnique, IsArray, IsEnum } from 'class-validator';
 import { CuisineType, DishType } from '@prisma/client';
+import { ArrayMinSize, ArrayUnique, IsArray, IsEnum } from 'class-validator';
 
 /**
  * Body for `PUT /v1/sellers/me/cuisines`. Replaces the seller's full set

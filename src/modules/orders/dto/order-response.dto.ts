@@ -1,10 +1,10 @@
-import type { Order, OrderItem, OrderItemAddOn } from '@prisma/client';
-
 import { DeliveryTiming } from '@common/enums/delivery-timing.enum';
 import { FulfillmentChoice } from '@common/enums/fulfillment-choice.enum';
 import { OrderStatus } from '@common/enums/order-status.enum';
 
 import { AddressResponseDto } from '@modules/users/dto/address-response.dto';
+
+import type { Order, OrderItem, OrderItemAddOn } from '@prisma/client';
 
 export class OrderItemAddOnResponseDto {
   id!: string;
@@ -65,7 +65,8 @@ export class OrderResponseDto {
   commissionRateBps!: number;
 
   fulfillmentChoice!: FulfillmentChoice;
-  dropoffAddress!: AddressResponseDto;
+  /** Null for PICKUP orders (no delivery address). */
+  dropoffAddress!: AddressResponseDto | null;
   deliveryInstructions!: string | null;
 
   deliveryTiming!: DeliveryTiming;
@@ -88,7 +89,7 @@ export class OrderResponseDto {
     order: Order & {
       items: Array<OrderItem & { addOns: OrderItemAddOn[] }>;
     },
-    dropoffAddress: AddressResponseDto,
+    dropoffAddress: AddressResponseDto | null,
   ): OrderResponseDto {
     return {
       id: order.id,

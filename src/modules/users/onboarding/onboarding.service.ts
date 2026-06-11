@@ -1,16 +1,7 @@
 import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
-import {
-  AddressKind,
-  CharterKind,
-  KycDocType,
-  KycStatus,
-  SellerCategory,
-} from '@prisma/client';
+import { AddressKind, CharterKind, KycDocType, KycStatus, SellerCategory } from '@prisma/client';
 
-import {
-  DriverVehicleType,
-  MOTORIZED_VEHICLES,
-} from '@common/enums/driver-vehicle-type.enum';
+import { DriverVehicleType, MOTORIZED_VEHICLES } from '@common/enums/driver-vehicle-type.enum';
 import {
   ID_DOCUMENT_TYPES_REQUIRING_VERSO,
   IdDocumentType,
@@ -179,9 +170,7 @@ export class OnboardingService {
 
     // Fait-maison sellers don't go through KYC at all (auto-approved at
     // signup). Their KYC steps are skipped.
-    const kycIdStatus: StepStatus = isFaitMaison
-      ? 'skipped'
-      : derivKycIdStatus(kycDocs);
+    const kycIdStatus: StepStatus = isFaitMaison ? 'skipped' : derivKycIdStatus(kycDocs);
     const kycSelfieStatus: StepStatus = isFaitMaison
       ? 'skipped'
       : derivSlotStatus(kycDocs, KycDocType.SELFIE);
@@ -203,9 +192,7 @@ export class OnboardingService {
       charter: charterStatus,
     };
 
-    const allDone = Object.values(steps).every(
-      (s) => s === 'complete' || s === 'skipped',
-    );
+    const allDone = Object.values(steps).every((s) => s === 'complete' || s === 'skipped');
     const canList = allDone && summary.kycStatus === KycStatus.APPROVED;
 
     return {
@@ -278,9 +265,7 @@ export class OnboardingService {
       charter: charterStatus,
     };
 
-    const allDone = Object.values(steps).every(
-      (s) => s === 'complete' || s === 'skipped',
-    );
+    const allDone = Object.values(steps).every((s) => s === 'complete' || s === 'skipped');
     const canDeliver = allDone && summary.kycStatus === KycStatus.APPROVED;
 
     return {
@@ -294,10 +279,7 @@ export class OnboardingService {
 
   // -------------------- helpers --------------------
 
-  private async charterStatus(
-    userId: string,
-    required: CharterKind[],
-  ): Promise<StepStatus> {
+  private async charterStatus(userId: string, required: CharterKind[]): Promise<StepStatus> {
     if (required.length === 0) return 'complete';
     const rows = await this.prisma.db.userCharter.findMany({
       where: {
@@ -352,8 +334,7 @@ function derivKycIdStatus(
   if (!front || front.reviewState === KycStatus.REJECTED) return 'incomplete';
 
   const idDocType = readIdDocumentType(front.metadata);
-  const requiresVerso =
-    idDocType !== null && ID_DOCUMENT_TYPES_REQUIRING_VERSO.has(idDocType);
+  const requiresVerso = idDocType !== null && ID_DOCUMENT_TYPES_REQUIRING_VERSO.has(idDocType);
 
   const slots: StepStatus[] = [
     front.reviewState === KycStatus.PENDING ? 'pending_review' : 'complete',

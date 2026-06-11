@@ -5,7 +5,6 @@ import {
   InternalServerErrorException,
   NotFoundException,
 } from '@nestjs/common';
-import type { ConfigType } from '@nestjs/config';
 import { ulid } from 'ulid';
 
 import { SellerCategory } from '@common/enums/seller-category.enum';
@@ -18,6 +17,8 @@ import { SupabaseAdminService } from '@infrastructure/supabase/supabase-admin.se
 
 import { CreateUploadUrlDto, UploadPurpose } from './dto/create-upload-url.dto';
 import { UploadUrlResponseDto } from './dto/upload-url-response.dto';
+
+import type { ConfigType } from '@nestjs/config';
 
 /**
  * Maps each upload purpose to a config-bucket key and a role/category

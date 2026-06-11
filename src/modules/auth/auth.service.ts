@@ -3,22 +3,22 @@ import {
   ConflictException,
   HttpException,
   HttpStatus,
-  Inject,
   Injectable,
   InternalServerErrorException,
   Logger,
   UnauthorizedException,
 } from '@nestjs/common';
-import type { ConfigType } from '@nestjs/config';
-import type { AuthError, Session, User } from '@supabase/supabase-js';
-
-import { supabaseConfig } from '@config/supabase.config';
+import { Prisma } from '@prisma/client';
 
 import { PrismaService } from '@infrastructure/database/prisma.service';
+import { PreludeVerifyService } from '@infrastructure/notifications/sms/prelude-verify.service';
 import { SupabaseAdminService } from '@infrastructure/supabase/supabase-admin.service';
 import { SupabaseService } from '@infrastructure/supabase/supabase.service';
 
+import { PhoneVerifyResponseDto } from './dto/phone-verify-response.dto';
 import { SessionResponseDto } from './dto/session-response.dto';
+
+import type { AuthError, Session, User } from '@supabase/supabase-js';
 
 /**
  * Thin proxy in front of Supabase Auth. The Flutter app only ever talks to
@@ -41,8 +41,7 @@ export class AuthService {
     private readonly anon: SupabaseService,
     private readonly admin: SupabaseAdminService,
     private readonly prisma: PrismaService,
-    @Inject(supabaseConfig.KEY)
-    private readonly cfg: ConfigType<typeof supabaseConfig>,
+    private readonly prelude: PreludeVerifyService,
   ) {}
 
   async signUp(email: string, password: string): Promise<SessionResponseDto> {
@@ -53,9 +52,7 @@ export class AuthService {
     if (!data.session) {
       // Email confirmation required by Supabase config. We don't return a
       // session here — caller must re-signin once they've confirmed.
-      throw new BadRequestException(
-        'Account created — confirm your email before signing in',
-      );
+      throw new BadRequestException('Account created — confirm your email before signing in');
     }
     return this.toSession(data.session);
   }
@@ -139,6 +136,29 @@ export class AuthService {
   }
 
   /**
+   * Confirms the 6-digit recovery code sent by `requestPasswordReset` and
+   * returns the recovery session. The client then calls
+   * `POST /v1/auth/password/update` with the returned `accessToken` as Bearer
+   * to set the new password. The code is the same `recovery` OTP Supabase
+   * issues for `resetPasswordForEmail`, surfaced via the `{{ .Token }}` email
+   * template instead of a link.
+   */
+  async verifyPasswordResetOtp(email: string, code: string): Promise<SessionResponseDto> {
+    const { data, error } = await this.anon.client.auth.verifyOtp({
+      email,
+      token: code,
+      type: 'recovery',
+    });
+    if (error || !data.session) {
+      throw this.toHttpException(
+        error ?? ({ message: 'reset code verification failed', status: 401 } as AuthError),
+        'password reset OTP verify failed',
+      );
+    }
+    return this.toSession(data.session);
+  }
+
+  /**
    * Sets a new password for the user identified by `userId` (taken from the
    * verified JWT). Used by both the "I forgot my password" recovery flow
    * (where the Bearer comes from the email magic link) and the normal
@@ -154,11 +174,9 @@ export class AuthService {
   }
 
   /**
-   * Temporary SMS-OTP bypass: sends a 6-digit code to the caller's own
-   * email (resolved from the JWT, never the body) via Supabase's email
-   * OTP. Pair with `verifyEmailOtp` to flip `User.phoneVerified` without
-   * an SMS roundtrip. Remove both methods + endpoints once the SMS
-   * provider is back.
+   * Sends a 6-digit email verification code to the caller's own email
+   * (resolved from the JWT, never the body) via Supabase's email OTP. Pair
+   * with `verifyEmailOtp`, which flips `User.emailVerified = true`.
    */
   async requestEmailOtp(email: string): Promise<void> {
     const { error } = await this.anon.client.auth.signInWithOtp({
@@ -171,10 +189,9 @@ export class AuthService {
   }
 
   /**
-   * Verifies the email OTP, then mirrors a verified phone signal onto the
-   * caller's User row (`phoneVerified = true`) so downstream gates that
-   * previously required SMS proof are satisfied. Returns the fresh
-   * Supabase session minted by verifyOtp.
+   * Verifies the email OTP and marks the caller's email as verified
+   * (`emailVerified = true`) on our User row. Returns the fresh Supabase
+   * session minted by verifyOtp.
    */
   async verifyEmailOtp(
     supabaseId: string,
@@ -200,7 +217,7 @@ export class AuthService {
     try {
       await this.prisma.db.user.update({
         where: { supabaseId },
-        data: { phoneVerified: true },
+        data: { emailVerified: true },
       });
     } catch (err) {
       const code = (err as { code?: string } | null)?.code;
@@ -214,97 +231,58 @@ export class AuthService {
   }
 
   /**
-   * Attaches a phone number to the authenticated user and triggers an OTP
-   * send. Calling again with a different phone overwrites the pending
-   * phone (Supabase last-write-wins on phone_change_token). The supabase-js
-   * SDK doesn't expose a user-context update without juggling sessions on
-   * a stateless backend, so we hit the REST API directly with the user's
-   * own Bearer token.
+   * Sends a phone OTP via Prelude Verify (server-side; the key never leaves
+   * the backend). We store NO code — Prelude owns the OTP lifecycle. Rejects a
+   * phone already attached to another user. [supabaseId] comes from the JWT.
    */
-  async requestPhoneOtp(accessToken: string, phone: string): Promise<void> {
-    const response = await fetch(`${this.cfg.url}/auth/v1/user`, {
-      method: 'PUT',
-      headers: {
-        apikey: this.cfg.anonKey,
-        Authorization: `Bearer ${accessToken}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ phone }),
-    });
-    if (!response.ok) {
-      const body = await readErrorBody(response);
-      throw this.mapSupabaseHttpError(response.status, body, 'phone OTP request failed');
-    }
+  async requestPhoneOtp(supabaseId: string, phone: string): Promise<void> {
+    await this.assertPhoneAvailable(supabaseId, phone);
+    await this.prelude.sendPhoneOtp(phone);
   }
 
   /**
-   * Confirms the OTP, marking the phone as verified on Supabase's
-   * auth.users and mirroring the value onto our User table.
-   *
-   * Supabase's verify returns a fresh session (the user's `aal` may bump
-   * after MFA verify), so we surface it — the client can swap tokens to
-   * keep `phoneConfirmedAt` up-to-date in subsequent /me reads.
+   * Verifies the OTP via Prelude. On success, marks the phone verified on our
+   * User row (the source of truth) — no new session is issued (the caller is
+   * already authenticated). Prelude statuses map to clear French errors.
    */
   async verifyPhoneOtp(
-    accessToken: string,
+    supabaseId: string,
     phone: string,
     code: string,
-  ): Promise<SessionResponseDto> {
-    const response = await fetch(`${this.cfg.url}/auth/v1/verify`, {
-      method: 'POST',
-      headers: {
-        apikey: this.cfg.anonKey,
-        Authorization: `Bearer ${accessToken}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ phone, token: code, type: 'phone_change' }),
-    });
-    if (!response.ok) {
-      const body = await readErrorBody(response);
-      throw this.mapSupabaseHttpError(response.status, body, 'phone OTP verify failed');
+  ): Promise<PhoneVerifyResponseDto> {
+    const status = await this.prelude.verifyPhoneOtp(phone, code);
+    if (status === 'failure') {
+      throw new BadRequestException('Code de vérification invalide.');
+    }
+    if (status !== 'success') {
+      // expired_or_not_found / transaction_missing / transaction_mismatch / unknown
+      throw new BadRequestException('Code expiré. Veuillez demander un nouveau code.');
     }
 
-    const raw = (await response.json()) as {
-      access_token: string;
-      refresh_token: string;
-      expires_at?: number;
-      user: {
-        id: string;
-        email: string | null;
-        phone: string | null;
-        email_confirmed_at: string | null;
-        phone_confirmed_at: string | null;
-      };
-    };
+    await this.assertPhoneAvailable(supabaseId, phone);
+    try {
+      await this.prisma.db.user.update({
+        where: { supabaseId },
+        data: { phone, phoneVerified: true },
+      });
+    } catch (err) {
+      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+        throw new ConflictException('Ce numéro de téléphone est déjà utilisé.');
+      }
+      throw err;
+    }
+    return { phoneVerified: true, phone };
+  }
 
-    // Supabase stores phone in stripped form (no leading `+`); we store
-    // canonical E.164 so clients can display it without further transforms.
-    const canonicalPhone = raw.user.phone
-      ? raw.user.phone.startsWith('+')
-        ? raw.user.phone
-        : `+${raw.user.phone}`
-      : null;
-
-    await this.prisma.db.user.update({
-      where: { supabaseId: raw.user.id },
-      data: {
-        phone: canonicalPhone,
-        phoneVerified: raw.user.phone_confirmed_at !== null,
-      },
+  /** Rejects a phone already attached to a different user (phone is @unique). */
+  private async assertPhoneAvailable(supabaseId: string, phone: string): Promise<void> {
+    const taken = await this.prisma.db.user.findFirst({
+      where: { phone, NOT: { supabaseId } },
+      select: { id: true },
     });
-
-    return {
-      accessToken: raw.access_token,
-      refreshToken: raw.refresh_token,
-      expiresAt: raw.expires_at ?? 0,
-      user: {
-        id: raw.user.id,
-        email: raw.user.email,
-        phone: canonicalPhone,
-        emailConfirmedAt: raw.user.email_confirmed_at,
-        phoneConfirmedAt: raw.user.phone_confirmed_at,
-      },
-    };
+    if (taken) {
+      throw new ConflictException('Ce numéro de téléphone est déjà utilisé.');
+    }
   }
 
   // -------------------- internals --------------------
@@ -343,46 +321,9 @@ export class AuthService {
     if (status >= 400 && status < 500) {
       return new BadRequestException(error.message);
     }
-    this.logger.error(`Supabase auth ${fallback}: ${error.message} (code=${code} status=${status})`);
+    this.logger.error(
+      `Supabase auth ${fallback}: ${error.message} (code=${code} status=${status})`,
+    );
     return new InternalServerErrorException('Authentication service error');
-  }
-
-  /**
-   * Like `toHttpException` but for raw REST responses (used for phone OTP,
-   * where we hit /auth/v1/user and /auth/v1/verify directly).
-   */
-  private mapSupabaseHttpError(
-    status: number,
-    body: { error_code?: string; msg?: string; message?: string; error?: string },
-    fallback: string,
-  ): HttpException {
-    const code = body.error_code ?? body.error ?? '';
-    const message = body.msg ?? body.message ?? body.error ?? 'Unknown error';
-    if (status === 401 || code === 'otp_expired' || code === 'invalid_otp') {
-      return new UnauthorizedException(message);
-    }
-    if (status === 422 || code === 'phone_provider_disabled') {
-      return new BadRequestException(message);
-    }
-    if (status === 429) {
-      return new HttpException(message, HttpStatus.TOO_MANY_REQUESTS);
-    }
-    if (status >= 400 && status < 500) {
-      return new BadRequestException(message);
-    }
-    this.logger.error(`Supabase ${fallback}: status=${status} code=${code} msg=${message}`);
-    return new InternalServerErrorException('Authentication service error');
-  }
-}
-
-async function readErrorBody(
-  response: Response,
-): Promise<{ error_code?: string; msg?: string; message?: string; error?: string }> {
-  try {
-    return (await response.json()) as ReturnType<typeof readErrorBody> extends Promise<infer T>
-      ? T
-      : never;
-  } catch {
-    return { message: response.statusText };
   }
 }

@@ -1,3 +1,15 @@
+import { SubscriptionStatus } from '@prisma/client';
+
+import { CuisineType } from '@common/enums/cuisine-type.enum';
+import { DishType } from '@common/enums/dish-type.enum';
+import { KycStatus } from '@common/enums/kyc-status.enum';
+import { SellerCategory } from '@common/enums/seller-category.enum';
+
+import { isSubscriptionActive } from '@modules/subscriptions/subscription.util';
+
+import { AddressResponseDto } from './address-response.dto';
+import { OpeningHoursResponseDto } from './opening-hours-response.dto';
+
 import type {
   SellerBusiness,
   SellerCuisine,
@@ -5,14 +17,6 @@ import type {
   SellerOpeningHours,
   SellerProfile,
 } from '@prisma/client';
-
-import { CuisineType } from '@common/enums/cuisine-type.enum';
-import { DishType } from '@common/enums/dish-type.enum';
-import { KycStatus } from '@common/enums/kyc-status.enum';
-import { SellerCategory } from '@common/enums/seller-category.enum';
-
-import { AddressResponseDto } from './address-response.dto';
-import { OpeningHoursResponseDto } from './opening-hours-response.dto';
 
 /**
  * Seller profile as seen on /v1/users/me. After Phase A all signup-time
@@ -58,6 +62,13 @@ export class SellerProfileResponseDto {
   // Express onboarding before they can receive payouts.
   stripeOnboardingCompleted!: boolean;
 
+  // Mandatory platform subscription ($4/mo). `subscriptionActive` is the
+  // gate the app uses to unlock seller features; the raw status + renewal
+  // date drive the dashboard / paywall copy.
+  subscriptionStatus!: SubscriptionStatus;
+  subscriptionActive!: boolean;
+  subscriptionCurrentPeriodEnd!: string | null;
+
   openingHours!: OpeningHoursResponseDto[];
 
   static from(
@@ -95,6 +106,12 @@ export class SellerProfileResponseDto {
       categoryTag: profile.categoryTag,
       kycStatus: profile.kycStatus as KycStatus,
       stripeOnboardingCompleted: profile.stripeOnboardingCompleted,
+      subscriptionStatus: profile.subscriptionStatus,
+      subscriptionActive: isSubscriptionActive(
+        profile.subscriptionStatus,
+        profile.subscriptionCurrentPeriodEnd,
+      ),
+      subscriptionCurrentPeriodEnd: profile.subscriptionCurrentPeriodEnd?.toISOString() ?? null,
       openingHours,
     };
   }

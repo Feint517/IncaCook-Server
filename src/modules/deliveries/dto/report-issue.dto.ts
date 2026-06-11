@@ -1,5 +1,5 @@
-import { IsEnum, IsOptional, IsString, MaxLength, MinLength } from 'class-validator';
 import { OrderStatus } from '@prisma/client';
+import { IsEnum, IsOptional, IsString, MaxLength, MinLength } from 'class-validator';
 
 import { IssueSeverity } from '@common/enums/issue-severity.enum';
 
@@ -16,7 +16,9 @@ import { IssueSeverity } from '@common/enums/issue-severity.enum';
  * the issue.
  */
 export class ReportIssueDto {
-  @IsString() @MinLength(1) @MaxLength(120)
+  @IsString()
+  @MinLength(1)
+  @MaxLength(120)
   issueCode!: string;
 
   @IsEnum(IssueSeverity)
@@ -26,6 +28,8 @@ export class ReportIssueDto {
   @IsEnum(OrderStatus)
   stageWhenReported!: OrderStatus;
 
-  @IsOptional() @IsString() @MaxLength(2000)
+  @IsOptional()
+  @IsString()
+  @MaxLength(2000)
   freeText?: string;
 }

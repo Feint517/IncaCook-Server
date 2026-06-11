@@ -22,10 +22,14 @@ import { CreateReviewCriterionDto } from './create-review-criterion.dto';
  */
 export class CreateReviewDto {
   /** 1–5 stars. DB CHECK constraint enforces this too. */
-  @IsInt() @Min(1) @Max(5)
+  @IsInt()
+  @Min(1)
+  @Max(5)
   rating!: number;
 
-  @IsString() @MinLength(1) @MaxLength(2000)
+  @IsString()
+  @MinLength(1)
+  @MaxLength(2000)
   body!: string;
 
   /**

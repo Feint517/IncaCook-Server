@@ -4,17 +4,6 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import type {
-  Address,
-  BuyerProfile,
-  DriverProfile,
-  SellerBusiness,
-  SellerCuisine,
-  SellerDish,
-  SellerOpeningHours,
-  SellerProfile,
-  User,
-} from '@prisma/client';
 import { AddressKind, UserCharter } from '@prisma/client';
 
 import { UserRole } from '@common/enums/user-role.enum';
@@ -26,6 +15,18 @@ import { SupabaseAdminService } from '@infrastructure/supabase/supabase-admin.se
 import { CreateUserDto } from './dto/create-user.dto';
 import { RecordCharterDto } from './dto/record-charter.dto';
 import { UpsertAddressDto } from './dto/upsert-address.dto';
+
+import type {
+  Address,
+  BuyerProfile,
+  DriverProfile,
+  SellerBusiness,
+  SellerCuisine,
+  SellerDish,
+  SellerOpeningHours,
+  SellerProfile,
+  User,
+} from '@prisma/client';
 
 /** URL `:kind` segment → AddressKind enum mapping for cleaner URLs. */
 const ADDRESS_KIND_FROM_PATH: Readonly<Record<string, AddressKind>> = {
@@ -155,6 +156,43 @@ export class UsersService {
   }
 
   /**
+   * Edits the caller's profile basics (display name + avatar). Any role.
+   * Only provided fields are updated; returns the full refreshed aggregate
+   * so the app can re-hydrate its user cache. `avatarPath` is a storage
+   * object key from the upload flow.
+   */
+  async updateProfile(
+    supabaseId: string,
+    dto: {
+      firstName?: string;
+      lastName?: string;
+      phone?: string;
+      avatarPath?: string;
+    },
+  ): Promise<UserAggregate> {
+    const existing = await this.prisma.db.user.findUnique({
+      where: { supabaseId },
+      select: { id: true },
+    });
+    if (!existing) {
+      throw new NotFoundException('User profile not found');
+    }
+    await this.prisma.db.user.update({
+      where: { id: existing.id },
+      data: {
+        ...(dto.firstName !== undefined ? { firstName: dto.firstName } : {}),
+        ...(dto.lastName !== undefined ? { lastName: dto.lastName } : {}),
+        // Edits the display phone on the User row. Does not touch the
+        // Supabase auth phone / phoneVerified — re-verification is a
+        // separate OTP flow.
+        ...(dto.phone !== undefined ? { phone: dto.phone } : {}),
+        ...(dto.avatarPath !== undefined ? { avatarPath: dto.avatarPath } : {}),
+      },
+    });
+    return this.findBySupabaseId(supabaseId);
+  }
+
+  /**
    * Gate 2 of signup (see docs/signup-flow.md §2.2). Creates the IncaCook
    * `User` row backed by the Supabase auth identity in the JWT, plus an
    * empty role-specific profile stub. Role-specific data (addresses, KYC,
@@ -175,15 +213,13 @@ export class UsersService {
 
     const userId = generateUlid();
 
-    // SMS-OTP bypass: if Supabase has already confirmed the email (Google
-    // sign-in, or a separate email OTP run before Gate 2), trust that as
-    // proof of contactability and default `phoneVerified = true`. Removes
-    // the ordering constraint between /v1/auth/email/verify and Gate 2.
-    // Once the SMS provider is back this can revert to a hard `false`.
-    const supabaseUser = await this.admin.client.auth.admin.getUserById(
-      identity.supabaseId,
-    );
-    const phoneVerified = supabaseUser.data.user?.email_confirmed_at != null;
+    // Mirror Supabase's verification state. Email and phone are tracked
+    // independently: emailVerified reflects email_confirmed_at (set by signup
+    // / email OTP), phoneVerified reflects phone_confirmed_at (set only by the
+    // phone OTP flow).
+    const supabaseUser = await this.admin.client.auth.admin.getUserById(identity.supabaseId);
+    const emailVerified = supabaseUser.data.user?.email_confirmed_at != null;
+    const phoneVerified = supabaseUser.data.user?.phone_confirmed_at != null;
 
     await this.prisma.$transaction(async (tx) => {
       await tx.user.create({
@@ -195,6 +231,7 @@ export class UsersService {
           role: dto.role,
           firstName: dto.firstName,
           lastName: dto.lastName,
+          emailVerified,
           phoneVerified,
           acceptedCgu: dto.acceptedCgu,
           acceptedCgv: dto.acceptedCgv,
@@ -251,9 +288,7 @@ export class UsersService {
           ? UserRole.Seller
           : UserRole.Driver;
     if (user.role !== expectedRole) {
-      throw new BadRequestException(
-        `Address kind ${kind} is reserved for ${expectedRole}`,
-      );
+      throw new BadRequestException(`Address kind ${kind} is reserved for ${expectedRole}`);
     }
 
     const existing = await this.prisma.db.address.findFirst({
@@ -318,6 +353,142 @@ export class UsersService {
     return row;
   }
 
+  // -------------------- Address CRUD (multi-address) --------------------
+
+  /** The AddressKind a given role owns (used when creating addresses). */
+  private kindForRole(role: UserRole): AddressKind {
+    switch (role) {
+      case UserRole.Seller:
+        return AddressKind.SELLER_PICKUP;
+      case UserRole.Driver:
+        return AddressKind.DRIVER_HOME;
+      default:
+        return AddressKind.BUYER_DELIVERY;
+    }
+  }
+
+  /** All of the caller's non-deleted addresses + their coordinates. */
+  async listAddresses(
+    supabaseId: string,
+  ): Promise<Array<{ address: Address; coords: { lat: number; lng: number } | null }>> {
+    const user = await this.prisma.db.user.findUnique({
+      where: { supabaseId },
+      select: { id: true },
+    });
+    if (!user) throw new NotFoundException('User profile not found');
+    const rows = await this.prisma.db.address.findMany({
+      where: { userId: user.id, deletedAt: null },
+      orderBy: { updatedAt: 'desc' },
+    });
+    const coords = await Promise.all(rows.map((r) => this.readAddressCoords(r.id)));
+    return rows.map((address, i) => ({ address, coords: coords[i] }));
+  }
+
+  /** Creates a new address owned by the caller (kind derived from role). */
+  async createAddress(
+    supabaseId: string,
+    dto: UpsertAddressDto,
+  ): Promise<{ address: Address; coords: { lat: number; lng: number } | null }> {
+    const user = await this.prisma.db.user.findUnique({
+      where: { supabaseId },
+      select: { id: true, role: true },
+    });
+    if (!user) throw new NotFoundException('User profile not found');
+    const kind = this.kindForRole(user.role as UserRole);
+    const row = await this.prisma.db.address.create({
+      data: {
+        id: generateUlid(),
+        userId: user.id,
+        kind,
+        fullAddress: dto.fullAddress,
+        city: dto.city,
+        postalCode: dto.postalCode,
+        type: dto.type ?? null,
+        customLabel: dto.customLabel ?? null,
+        apartment: dto.apartment ?? null,
+        floor: dto.floor ?? null,
+        digicode: dto.digicode ?? null,
+        deliveryNotes: dto.deliveryNotes ?? null,
+      },
+    });
+    await this.writePointIfPresent(row.id, user.id, kind, dto);
+    return { address: row, coords: await this.readAddressCoords(row.id) };
+  }
+
+  /** Updates one of the caller's addresses by id (ownership enforced). */
+  async updateAddressById(
+    supabaseId: string,
+    addressId: string,
+    dto: UpsertAddressDto,
+  ): Promise<{ address: Address; coords: { lat: number; lng: number } | null }> {
+    const user = await this.prisma.db.user.findUnique({
+      where: { supabaseId },
+      select: { id: true },
+    });
+    if (!user) throw new NotFoundException('User profile not found');
+    const existing = await this.prisma.db.address.findFirst({
+      where: { id: addressId, userId: user.id, deletedAt: null },
+    });
+    if (!existing) throw new NotFoundException('Address not found');
+    const row = await this.prisma.db.address.update({
+      where: { id: existing.id },
+      data: {
+        fullAddress: dto.fullAddress,
+        city: dto.city,
+        postalCode: dto.postalCode,
+        type: dto.type ?? null,
+        customLabel: dto.customLabel ?? null,
+        apartment: dto.apartment ?? null,
+        floor: dto.floor ?? null,
+        digicode: dto.digicode ?? null,
+        deliveryNotes: dto.deliveryNotes ?? null,
+      },
+    });
+    await this.writePointIfPresent(row.id, user.id, existing.kind, dto);
+    return { address: row, coords: await this.readAddressCoords(row.id) };
+  }
+
+  /** Soft-deletes one of the caller's addresses by id (ownership enforced). */
+  async deleteAddressById(supabaseId: string, addressId: string): Promise<void> {
+    const user = await this.prisma.db.user.findUnique({
+      where: { supabaseId },
+      select: { id: true },
+    });
+    if (!user) throw new NotFoundException('User profile not found');
+    const existing = await this.prisma.db.address.findFirst({
+      where: { id: addressId, userId: user.id, deletedAt: null },
+      select: { id: true },
+    });
+    if (!existing) throw new NotFoundException('Address not found');
+    await this.prisma.db.address.update({
+      where: { id: existing.id },
+      data: { deletedAt: new Date() },
+    });
+  }
+
+  /** Writes the PostGIS point (and mirrors seller pickup → SellerProfile)
+   *  when lat/lng are present. Shared by create/update. */
+  private async writePointIfPresent(
+    addressId: string,
+    userId: string,
+    kind: AddressKind,
+    dto: UpsertAddressDto,
+  ): Promise<void> {
+    if (dto.lat === undefined || dto.lng === undefined) return;
+    await this.prisma.$executeRaw`
+      UPDATE "Address"
+      SET "point" = ST_SetSRID(ST_MakePoint(${dto.lng}, ${dto.lat}), 4326)
+      WHERE "id" = ${addressId}
+    `;
+    if (kind === AddressKind.SELLER_PICKUP) {
+      await this.prisma.$executeRaw`
+        UPDATE "SellerProfile"
+        SET "location" = ST_SetSRID(ST_MakePoint(${dto.lng}, ${dto.lat}), 4326)
+        WHERE "userId" = ${userId}
+      `;
+    }
+  }
+
   // -------------------- Charters --------------------
 
   async recordCharter(supabaseId: string, dto: RecordCharterDto): Promise<UserCharter> {
@@ -350,9 +521,7 @@ export class UsersService {
    * Reads lat/lng out of the Unsupported PostGIS `point` column. Returns
    * null when the address has no geocoded coordinates yet.
    */
-  private async readAddressCoords(
-    addressId: string,
-  ): Promise<{ lat: number; lng: number } | null> {
+  private async readAddressCoords(addressId: string): Promise<{ lat: number; lng: number } | null> {
     const rows = await this.prisma.$queryRaw<Array<{ lat: number; lng: number }>>`
       SELECT
         ST_Y("point"::geometry)::float8 AS "lat",

@@ -1,23 +1,11 @@
-import {
-  Body,
-  Controller,
-  Get,
-  HttpCode,
-  HttpStatus,
-  Param,
-  Post,
-  Query,
-} from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, HttpStatus, Param, Post, Query } from '@nestjs/common';
 
 import { CurrentUser } from '@common/decorators/current-user.decorator';
 import type { AuthenticatedUser } from '@common/types/authenticated-request.type';
 
 import { CreateReviewDto } from './dto/create-review.dto';
 import { ListReviewsQueryDto } from './dto/list-reviews.query.dto';
-import {
-  ReviewListResponseDto,
-  ReviewResponseDto,
-} from './dto/review-response.dto';
+import { ReviewListResponseDto, ReviewResponseDto } from './dto/review-response.dto';
 import { SellerStatsResponseDto } from './dto/seller-stats-response.dto';
 import { ReviewsService } from './reviews.service';
 

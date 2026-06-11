@@ -1,10 +1,10 @@
-import type { User } from '@prisma/client';
-
 import { UserRole } from '@common/enums/user-role.enum';
 
 import { BuyerProfileResponseDto } from './buyer-profile-response.dto';
 import { DriverProfileResponseDto } from './driver-profile-response.dto';
 import { SellerProfileResponseDto } from './seller-profile-response.dto';
+
+import type { User } from '@prisma/client';
 
 /**
  * Public shape returned by `GET /v1/users/me` and `POST /v1/users`.

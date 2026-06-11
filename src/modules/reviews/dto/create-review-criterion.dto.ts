@@ -13,10 +13,13 @@ export class CreateReviewCriterionDto {
 
   // Bounds enforced per-criterion in the service. 0–5 for score5, 0–100 for percent.
   @IsNumber({ maxDecimalPlaces: 1 })
-  @Min(0) @Max(100)
+  @Min(0)
+  @Max(100)
   @Type(() => Number)
   value!: number;
 
-  @IsOptional() @IsInt() @Min(1)
+  @IsOptional()
+  @IsInt()
+  @Min(1)
   sampleCount?: number;
 }

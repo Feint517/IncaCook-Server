@@ -11,7 +11,7 @@ import { IsString, Matches } from 'class-validator';
 export class RequestPhoneOtpDto {
   @IsString()
   @Matches(/^\+[1-9]\d{6,14}$/, {
-    message: 'phone must be E.164 (e.g. +33611111111)',
+    message: "Veuillez saisir un numéro de téléphone valide avec l'indicatif du pays.",
   })
   phone!: string;
 }

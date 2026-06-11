@@ -19,26 +19,17 @@ export class SellersController {
   ) {}
 
   @Put('profile')
-  upsertProfile(
-    @CurrentUser() jwtUser: AuthenticatedUser,
-    @Body() dto: UpsertSellerProfileDto,
-  ) {
+  upsertProfile(@CurrentUser() jwtUser: AuthenticatedUser, @Body() dto: UpsertSellerProfileDto) {
     return this.sellers.upsertProfile(jwtUser.id, dto);
   }
 
   @Put('business')
-  upsertBusiness(
-    @CurrentUser() jwtUser: AuthenticatedUser,
-    @Body() dto: UpsertSellerBusinessDto,
-  ) {
+  upsertBusiness(@CurrentUser() jwtUser: AuthenticatedUser, @Body() dto: UpsertSellerBusinessDto) {
     return this.sellers.upsertBusiness(jwtUser.id, dto);
   }
 
   @Put('cuisines')
-  upsertCuisines(
-    @CurrentUser() jwtUser: AuthenticatedUser,
-    @Body() dto: UpsertSellerCuisinesDto,
-  ) {
+  upsertCuisines(@CurrentUser() jwtUser: AuthenticatedUser, @Body() dto: UpsertSellerCuisinesDto) {
     return this.sellers.upsertCuisines(jwtUser.id, dto);
   }
 
@@ -48,9 +39,7 @@ export class SellersController {
    * buyer feed at `GET /v1/listings`. Soft-deleted rows are excluded.
    */
   @Get('listings')
-  async myListings(
-    @CurrentUser() jwtUser: AuthenticatedUser,
-  ): Promise<ListingResponseDto[]> {
+  async myListings(@CurrentUser() jwtUser: AuthenticatedUser): Promise<ListingResponseDto[]> {
     const listings = await this.listings.findMine(jwtUser.id);
     return listings.map((l) => ListingResponseDto.from(l));
   }

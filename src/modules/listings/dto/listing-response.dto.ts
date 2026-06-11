@@ -1,11 +1,11 @@
-import type { Listing, ListingAddOn } from '@prisma/client';
-
 import { Allergen } from '@common/enums/allergen.enum';
 import { CuisineType } from '@common/enums/cuisine-type.enum';
 import { DietaryTag } from '@common/enums/dietary-tag.enum';
 import { DishType } from '@common/enums/dish-type.enum';
 import { Fulfillment } from '@common/enums/fulfillment.enum';
 import { SellerCategory } from '@common/enums/seller-category.enum';
+
+import type { Listing, ListingAddOn } from '@prisma/client';
 
 /** Single extras row in the listing detail response. Internal model: `ListingAddOn`. */
 export class ListingExtraResponseDto {

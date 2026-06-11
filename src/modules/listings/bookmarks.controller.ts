@@ -1,29 +1,20 @@
-import {
-  Controller,
-  Delete,
-  Get,
-  HttpCode,
-  HttpStatus,
-  Param,
-  Post,
-  Query,
-} from '@nestjs/common';
+import { Controller, Delete, Get, HttpCode, HttpStatus, Param, Post, Query } from '@nestjs/common';
 
 import { CurrentUser } from '@common/decorators/current-user.decorator';
-import type { AuthenticatedUser } from '@common/types/authenticated-request.type';
-
 import { Allergen } from '@common/enums/allergen.enum';
 import { CuisineType } from '@common/enums/cuisine-type.enum';
 import { DietaryTag } from '@common/enums/dietary-tag.enum';
 import { DishType } from '@common/enums/dish-type.enum';
 import { Fulfillment } from '@common/enums/fulfillment.enum';
 import { SellerCategory } from '@common/enums/seller-category.enum';
+import type { AuthenticatedUser } from '@common/types/authenticated-request.type';
 
 import { BookmarksService } from './bookmarks.service';
-import type { FeedRow } from './listings.service';
 import { FeedListingResponseDto } from './dto/feed-listing-response.dto';
 import { FeedResponseDto } from './dto/feed-response.dto';
 import { ListFeedQueryDto } from './dto/list-feed-query.dto';
+
+import type { FeedRow } from './listings.service';
 
 /**
  * Bookmarks split across two URL spaces:

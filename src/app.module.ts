@@ -49,6 +49,7 @@ import { ReviewsModule } from '@modules/reviews/reviews.module';
 import { SearchModule } from '@modules/search/search.module';
 import { SellersModule } from '@modules/sellers/sellers.module';
 import { SubscriptionsModule } from '@modules/subscriptions/subscriptions.module';
+import { TrackingModule } from '@modules/tracking/tracking.module';
 import { UsersModule } from '@modules/users/users.module';
 import { WalletsModule } from '@modules/wallets/wallets.module';
 
@@ -103,6 +104,7 @@ import { WalletsModule } from '@modules/wallets/wallets.module';
     ModerationModule,
     CatalogModule,
     SearchModule,
+    TrackingModule,
     GeoModule,
     FilesModule,
     ComplianceModule,

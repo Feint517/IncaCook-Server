@@ -6,20 +6,36 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { DeliveryStatus } from '@prisma/client';
-import type { Delivery, Order } from '@prisma/client';
 
 import { IssueSeverity } from '@common/enums/issue-severity.enum';
 import { KycStatus } from '@common/enums/kyc-status.enum';
+import { OrderStatus } from '@common/enums/order-status.enum';
 import { UserRole } from '@common/enums/user-role.enum';
 import { generateUlid } from '@common/utils/code-generator.util';
 
 import { AuditService } from '@infrastructure/audit/audit.service';
 import { PrismaService } from '@infrastructure/database/prisma.service';
+import { RedisService } from '@infrastructure/redis/redis.service';
 
+import { NotificationsService } from '@modules/notifications/notifications.service';
 import { OrdersService } from '@modules/orders/orders.service';
+import { driverLocChannel } from '@modules/tracking/tracking.gateway';
 
+import { DeliveryEnrichment } from './dto/delivery-response.dto';
+import { DriverLocationDto } from './dto/driver-location.dto';
 import { OnlineStatusDto } from './dto/online-status.dto';
 import { ReportIssueDto } from './dto/report-issue.dto';
+
+import type { Delivery, Order } from '@prisma/client';
+
+const ACTIVE_DELIVERY_STATUSES: DeliveryStatus[] = [
+  DeliveryStatus.ASSIGNED,
+  DeliveryStatus.EN_ROUTE_TO_PICKUP,
+  DeliveryStatus.AT_PICKUP,
+  DeliveryStatus.PICKED_UP,
+  DeliveryStatus.EN_ROUTE_TO_DROPOFF,
+  DeliveryStatus.AT_DROPOFF,
+];
 
 type DeliveryWithRelations = Delivery & {
   order: Pick<Order, 'orderNumber' | 'status' | 'fulfillmentFeeCents'> & {
@@ -27,7 +43,10 @@ type DeliveryWithRelations = Delivery & {
     // would surface as null; not a problem for drivers since deliveries are
     // only created for sellers who can take orders (gate in orders.service).
     seller: { neighborhood: string | null };
-    dropoffAddress: { city: string; postalCode: string };
+    // Nullable on the Order model (PICKUP orders carry no dropoff), but in
+    // practice always present here — deliveries are only created for
+    // DELIVERY orders. Typed nullable to match Prisma; readers coalesce.
+    dropoffAddress: { city: string; postalCode: string } | null;
   };
 };
 
@@ -51,6 +70,8 @@ export class DeliveriesService {
     private readonly prisma: PrismaService,
     private readonly orders: OrdersService,
     private readonly audit: AuditService,
+    private readonly redis: RedisService,
+    private readonly notifications: NotificationsService,
   ) {}
 
   // -----------------------------------------------------------------------
@@ -60,10 +81,20 @@ export class DeliveriesService {
   async setOnline(supabaseId: string, dto: OnlineStatusDto): Promise<void> {
     const driver = await this.assertDriver(supabaseId);
 
+    // Dev fallback: in production a driver must have an admin-approved
+    // KYC submission before going online. In NODE_ENV=development we
+    // auto-promote any non-approved driver so the e2e demo doesn't
+    // require running the admin KYC review flow for every fresh signup.
     if (dto.isOnline && driver.kycStatus !== KycStatus.Approved) {
-      throw new ForbiddenException(
-        'Driver KYC must be APPROVED before going online',
-      );
+      if (process.env.NODE_ENV === 'development') {
+        await this.prisma.db.driverProfile.update({
+          where: { userId: driver.userId },
+          data: { kycStatus: KycStatus.Approved },
+        });
+        this.logger.debug(`[dev] auto-approved driver KYC for ${driver.userId}`);
+      } else {
+        throw new ForbiddenException('Driver KYC must be APPROVED before going online');
+      }
     }
 
     await this.prisma.db.driverProfile.update({
@@ -86,31 +117,221 @@ export class DeliveriesService {
     }
   }
 
+  /**
+   * High-frequency driver position update. Persists `lastKnownPoint` as a
+   * periodic flush and, when the driver has an active delivery, publishes
+   * the position to Redis so TrackingGateway can fan it out to the buyer's
+   * subscribed socket. Returns the deliveryId being broadcast on (if any),
+   * useful for the driver app to confirm wiring.
+   */
+  async recordLocation(
+    supabaseId: string,
+    dto: DriverLocationDto,
+  ): Promise<{ broadcast: boolean; deliveryId: string | null }> {
+    const driver = await this.assertDriver(supabaseId);
+    const now = new Date();
+
+    await this.prisma.$executeRaw`
+      UPDATE "DriverProfile"
+      SET "lastKnownPoint" = ST_SetSRID(ST_MakePoint(${dto.lng}, ${dto.lat}), 4326),
+          "lastSeenAt" = ${now}
+      WHERE "userId" = ${driver.userId}
+    `;
+
+    const active = await this.prisma.db.delivery.findFirst({
+      where: { driverId: driver.userId, status: { in: ACTIVE_DELIVERY_STATUSES } },
+      select: { id: true },
+      orderBy: { driverAssignedAt: 'desc' },
+    });
+
+    if (!active) return { broadcast: false, deliveryId: null };
+
+    const payload = JSON.stringify({
+      deliveryId: active.id,
+      lat: dto.lat,
+      lng: dto.lng,
+      headingDeg: dto.headingDeg,
+      speedMps: dto.speedMps,
+      at: now.toISOString(),
+    });
+    try {
+      await this.redis.client.publish(driverLocChannel(active.id), payload);
+    } catch (err) {
+      this.logger.warn(`location publish failed for ${active.id}: ${(err as Error).message}`);
+    }
+    return { broadcast: true, deliveryId: active.id };
+  }
+
   // -----------------------------------------------------------------------
   // Driver-side reads
   // -----------------------------------------------------------------------
 
   /**
-   * Available SEARCHING deliveries the driver can claim. v1: FIFO by
-   * createdAt, no geo filter. Adding distance-based scoring is a v2
-   * concern (smart matching).
+   * Available SEARCHING deliveries the driver can claim. Every online
+   * driver sees every unclaimed job, ordered nearest-first (driver →
+   * seller pickup), FIFO as the fallback/tiebreak. Whoever claims
+   * first wins (atomic; losers get a 409).
    */
   async listAvailable(
     supabaseId: string,
     limit: number,
     offset: number,
-  ): Promise<{ items: DeliveryWithRelations[]; hasMore: boolean }> {
-    await this.assertDriver(supabaseId);
+  ): Promise<{
+    items: Array<{ row: DeliveryWithRelations; enrichment: DeliveryEnrichment }>;
+    hasMore: boolean;
+  }> {
+    const driver = await this.assertDriver(supabaseId);
 
+    // Open dispatch: every unclaimed SEARCHING delivery is offered to
+    // every online driver. Ordering is nearest-first — distance from
+    // the calling driver's `lastKnownPoint` to the seller's pickup
+    // point (`SellerProfile.location`), FIFO by `createdAt` as the
+    // tiebreak and the fallback when either point is missing.
+    //
+    // Earlier this pinned each delivery to the single closest driver,
+    // which (a) hid every job from all other online drivers and (b)
+    // got stuck when that one driver declined — declines aren't
+    // persisted, so the job had nobody else to fall to. Showing the
+    // job to everyone + the atomic `claim` (409 on a lost race) gives
+    // the same nearest-first feel without starving anyone; the client
+    // tracks its own declines so a passed job advances to the next.
+    const eligible = await this.prisma.$queryRaw<Array<{ id: string }>>`
+      SELECT d.id
+      FROM "Delivery" d
+      JOIN "Order" o ON o.id = d."orderId"
+      JOIN "SellerProfile" s ON s."userId" = o."sellerId"
+      LEFT JOIN "DriverProfile" me ON me."userId" = ${driver.userId}
+      WHERE d.status = 'SEARCHING'
+        AND d."driverId" IS NULL
+      ORDER BY
+        CASE
+          WHEN me."lastKnownPoint" IS NOT NULL AND s.location IS NOT NULL
+          THEN me."lastKnownPoint" <-> s.location
+        END ASC NULLS LAST,
+        d."createdAt" ASC
+      LIMIT ${limit + 1} OFFSET ${offset};
+    `;
+
+    // Matching visibility. debug level: drivers poll this frequently, so we
+    // don't want it at log level — but it's here when diagnosing "driver is
+    // online but sees no jobs" (count 0 = no SEARCHING delivery, i.e. seller
+    // hasn't marked an order ready yet).
+    this.logger.debug(
+      `[lifecycle] driver ${driver.userId} available-poll → ${eligible.length} SEARCHING job(s) offered`,
+    );
+
+    if (eligible.length === 0) {
+      return { items: [], hasMore: false };
+    }
+
+    const ids = eligible.map((r) => r.id);
     const rows = await this.prisma.db.delivery.findMany({
-      where: { status: DeliveryStatus.SEARCHING, driverId: null },
+      where: { id: { in: ids } },
       include: DELIVERY_INCLUDE,
       orderBy: { createdAt: 'asc' },
-      take: limit + 1,
-      skip: offset,
     });
-    const hasMore = rows.length > limit;
-    return { items: hasMore ? rows.slice(0, limit) : rows, hasMore };
+
+    // Enrichment: PostGIS coords (which Prisma can't `select`) plus
+    // seller name + dropoff full address + order total + item count
+    // — everything the driver-app modal needs to render real data,
+    // and `DeliveryRouteController` needs to route the map to the
+    // actual seller pickup point.
+    const enrichment = await this.loadDeliveryEnrichment(ids);
+
+    const hasMore = ids.length > limit;
+    const sliced = hasMore ? rows.slice(0, limit) : rows;
+    return {
+      items: sliced.map((row) => ({
+        row,
+        enrichment: enrichment.get(row.id) ?? {
+          pickupLat: null,
+          pickupLng: null,
+          pickupFullAddress: null,
+          dropoffLat: null,
+          dropoffLng: null,
+          dropoffFullAddress: row.order.dropoffAddress?.city ?? '',
+          sellerName: null,
+          recipientName: null,
+          orderTotalCents: row.order.fulfillmentFeeCents,
+          placedAt: row.createdAt,
+          itemCount: 0,
+        },
+      })),
+      hasMore,
+    };
+  }
+
+  /**
+   * Single raw-SQL fetch for the geo + display fields the driver
+   * modal needs. PostGIS columns (`SellerProfile.location`,
+   * `Address.point`) aren't selectable through Prisma; this helper
+   * unwraps them with `ST_X`/`ST_Y` and joins user + items in the
+   * same trip to avoid an N+1.
+   */
+  private async loadDeliveryEnrichment(ids: string[]): Promise<Map<string, DeliveryEnrichment>> {
+    if (ids.length === 0) return new Map();
+    type Row = {
+      delivery_id: string;
+      pickup_lng: number | null;
+      pickup_lat: number | null;
+      dropoff_lng: number | null;
+      dropoff_lat: number | null;
+      dropoff_full_address: string;
+      seller_first_name: string | null;
+      seller_last_name: string | null;
+      buyer_first_name: string | null;
+      buyer_last_name: string | null;
+      order_total_cents: number;
+      placed_at: Date;
+      item_count: number | bigint;
+    };
+    const rows = await this.prisma.$queryRaw<Row[]>`
+      SELECT
+        d.id AS delivery_id,
+        ST_X(s.location::geometry) AS pickup_lng,
+        ST_Y(s.location::geometry) AS pickup_lat,
+        ST_X(a.point::geometry) AS dropoff_lng,
+        ST_Y(a.point::geometry) AS dropoff_lat,
+        a."fullAddress" AS dropoff_full_address,
+        u."firstName" AS seller_first_name,
+        u."lastName" AS seller_last_name,
+        b."firstName" AS buyer_first_name,
+        b."lastName" AS buyer_last_name,
+        o."buyerTotalCents" AS order_total_cents,
+        o."placedAt" AS placed_at,
+        (SELECT COALESCE(SUM(quantity), 0)
+         FROM "OrderItem"
+         WHERE "orderId" = o.id) AS item_count
+      FROM "Delivery" d
+      JOIN "Order" o ON o.id = d."orderId"
+      JOIN "User" u ON u.id = o."sellerId"
+      JOIN "User" b ON b.id = o."buyerId"
+      JOIN "Address" a ON a.id = o."dropoffAddressId"
+      JOIN "SellerProfile" s ON s."userId" = o."sellerId"
+      WHERE d.id = ANY(${ids}::text[]);
+    `;
+    const out = new Map<string, DeliveryEnrichment>();
+    for (const r of rows) {
+      const sellerName = [r.seller_first_name, r.seller_last_name].filter(Boolean).join(' ').trim();
+      const recipientName = [r.buyer_first_name, r.buyer_last_name]
+        .filter(Boolean)
+        .join(' ')
+        .trim();
+      out.set(r.delivery_id, {
+        pickupLat: r.pickup_lat,
+        pickupLng: r.pickup_lng,
+        pickupFullAddress: null,
+        dropoffLat: r.dropoff_lat,
+        dropoffLng: r.dropoff_lng,
+        dropoffFullAddress: r.dropoff_full_address,
+        sellerName: sellerName.length > 0 ? sellerName : null,
+        recipientName: recipientName.length > 0 ? recipientName : null,
+        orderTotalCents: r.order_total_cents,
+        placedAt: r.placed_at,
+        itemCount: typeof r.item_count === 'bigint' ? Number(r.item_count) : r.item_count,
+      });
+    }
+    return out;
   }
 
   /** Driver's own deliveries (current + history). */
@@ -133,10 +354,7 @@ export class DeliveriesService {
     return { items: hasMore ? rows.slice(0, limit) : rows, hasMore };
   }
 
-  async findById(
-    supabaseId: string,
-    deliveryId: string,
-  ): Promise<DeliveryWithRelations> {
+  async findById(supabaseId: string, deliveryId: string): Promise<DeliveryWithRelations> {
     const driver = await this.assertDriver(supabaseId);
     const delivery = await this.prisma.db.delivery.findUnique({
       where: { id: deliveryId },
@@ -147,7 +365,7 @@ export class DeliveriesService {
     }
     // Either claim-able (no driver yet) or owned by this driver.
     if (delivery.driverId && delivery.driverId !== driver.userId) {
-      throw new ForbiddenException('Cannot view another driver\'s delivery');
+      throw new ForbiddenException("Cannot view another driver's delivery");
     }
     return delivery;
   }
@@ -162,13 +380,31 @@ export class DeliveriesService {
    */
   async claim(supabaseId: string, deliveryId: string): Promise<DeliveryWithRelations> {
     const driver = await this.assertDriver(supabaseId);
+    const isDev = process.env.NODE_ENV === 'development';
+
     if (driver.kycStatus !== KycStatus.Approved) {
-      throw new ForbiddenException('Driver KYC must be APPROVED to claim deliveries');
+      if (isDev) {
+        await this.prisma.db.driverProfile.update({
+          where: { userId: driver.userId },
+          data: { kycStatus: KycStatus.Approved },
+        });
+        this.logger.debug(`[dev] auto-approved driver KYC for claim by ${driver.userId}`);
+      } else {
+        throw new ForbiddenException('Driver KYC must be APPROVED to claim deliveries');
+      }
     }
     if (!driver.stripeOnboardingCompleted) {
-      throw new ForbiddenException(
-        'Complete Stripe Connect onboarding before claiming deliveries',
-      );
+      if (isDev) {
+        await this.prisma.db.driverProfile.update({
+          where: { userId: driver.userId },
+          data: { stripeOnboardingCompleted: true },
+        });
+        this.logger.debug(`[dev] auto-completed Stripe Connect for ${driver.userId}`);
+      } else {
+        throw new ForbiddenException(
+          'Complete Stripe Connect onboarding before claiming deliveries',
+        );
+      }
     }
 
     // Race-safe atomic claim.
@@ -185,15 +421,32 @@ export class DeliveriesService {
     if (updated === 0) {
       throw new ConflictException('Delivery is no longer available');
     }
-    return this.loadDelivery(deliveryId);
+    this.logger.log(
+      `[lifecycle] delivery ${deliveryId} claimed → ASSIGNED to driver ${driver.userId}`,
+    );
+    const delivery = await this.loadDelivery(deliveryId);
+    // Buyer push: a driver is now assigned (self-wrapped; never throws).
+    await this.notifications.notifyDeliveryEvent(
+      delivery.orderId,
+      deliveryId,
+      'delivery_assigned',
+      { buyer: true },
+    );
+    return delivery;
   }
 
   /** ASSIGNED → AT_PICKUP. Driver has reached the seller. */
   async arriveAtPickup(supabaseId: string, deliveryId: string): Promise<DeliveryWithRelations> {
-    return this.transition(supabaseId, deliveryId, {
+    const delivery = await this.transition(supabaseId, deliveryId, {
       from: [DeliveryStatus.ASSIGNED],
       to: DeliveryStatus.AT_PICKUP,
     });
+    // Buyer + seller: the driver has arrived at the seller.
+    await this.notifications.notifyDeliveryEvent(delivery.orderId, deliveryId, 'driver_at_pickup', {
+      buyer: true,
+      seller: true,
+    });
+    return delivery;
   }
 
   /**
@@ -221,6 +474,12 @@ export class DeliveriesService {
         data: { status: 'IN_DELIVERY' },
       });
     });
+    // Buyer's tracking stepper jumps to "En route" the moment this lands.
+    await this.orders.publishOrderStatusChanged(delivery.orderId, OrderStatus.InDelivery);
+    // Buyer push: order picked up, now en route.
+    await this.notifications.notifyDeliveryEvent(delivery.orderId, deliveryId, 'order_picked_up', {
+      buyer: true,
+    });
 
     return this.loadDelivery(deliveryId);
   }
@@ -246,6 +505,14 @@ export class DeliveriesService {
 
     // Order transition + payout. Idempotent in OrdersService.
     await this.orders.confirmDeliveredByDriver(delivery.orderId);
+
+    // Buyer + seller push: delivered.
+    await this.notifications.notifyDeliveryEvent(
+      delivery.orderId,
+      deliveryId,
+      'delivery_completed',
+      { buyer: true, seller: true },
+    );
 
     return this.loadDelivery(deliveryId);
   }
@@ -357,7 +624,7 @@ export class DeliveriesService {
       throw new NotFoundException('Delivery not found');
     }
     if (delivery.driverId !== driverUserId) {
-      throw new ForbiddenException('Cannot act on another driver\'s delivery');
+      throw new ForbiddenException("Cannot act on another driver's delivery");
     }
     return delivery;
   }

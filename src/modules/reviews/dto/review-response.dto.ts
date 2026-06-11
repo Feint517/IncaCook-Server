@@ -1,6 +1,6 @@
-import type { Review, ReviewCriterionRating, User } from '@prisma/client';
-
 import { RatingCriterion } from '@common/enums/rating-criterion.enum';
+
+import type { Review, ReviewCriterionRating, User } from '@prisma/client';
 
 export class ReviewCriterionResponseDto {
   criterion!: RatingCriterion;
@@ -52,9 +52,7 @@ export class ReviewResponseDto {
         lastName: review.author.lastName,
         avatarPath: review.author.avatarPath,
       },
-      criteriaRatings: review.criteriaRatings.map((c) =>
-        ReviewCriterionResponseDto.from(c),
-      ),
+      criteriaRatings: review.criteriaRatings.map((c) => ReviewCriterionResponseDto.from(c)),
     };
   }
 }

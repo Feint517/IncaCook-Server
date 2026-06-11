@@ -1,3 +1,4 @@
+import { DayOfWeek } from '@prisma/client';
 import { Type } from 'class-transformer';
 import {
   ArrayMaxSize,
@@ -11,7 +12,6 @@ import {
   MinLength,
   ValidateNested,
 } from 'class-validator';
-import { DayOfWeek } from '@prisma/client';
 
 /** One opening-hours row, mirrors SellerOpeningHours. HH:MM (24h) strings. */
 export class OpeningHoursDto {
@@ -31,7 +31,9 @@ export class OpeningHoursDto {
  * Only valid for non-fait-maison sellers (service-layer enforced).
  */
 export class UpsertSellerBusinessDto {
-  @IsString() @MinLength(1) @MaxLength(200)
+  @IsString()
+  @MinLength(1)
+  @MaxLength(200)
   businessName!: string;
 
   /** 14 digits, Luhn-validated at the service layer. */
@@ -39,10 +41,14 @@ export class UpsertSellerBusinessDto {
   siret!: string;
 
   /** Storage object key in `seller-facades/` (Phase D signed URL flow). */
-  @IsOptional() @IsString() @MaxLength(500)
+  @IsOptional()
+  @IsString()
+  @MaxLength(500)
   facadeUrl?: string;
 
-  @IsOptional() @IsString() @MaxLength(80)
+  @IsOptional()
+  @IsString()
+  @MaxLength(80)
   legalForm?: string;
 
   @IsOptional()

@@ -11,9 +11,13 @@ export class OnlineStatusDto {
   @IsBoolean()
   isOnline!: boolean;
 
-  @IsOptional() @IsLatitude() @Type(() => Number)
+  @IsOptional()
+  @IsLatitude()
+  @Type(() => Number)
   lat?: number;
 
-  @IsOptional() @IsLongitude() @Type(() => Number)
+  @IsOptional()
+  @IsLongitude()
+  @Type(() => Number)
   lng?: number;
 }

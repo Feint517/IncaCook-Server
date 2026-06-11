@@ -12,18 +12,12 @@ export class DriversController {
   constructor(private readonly drivers: DriversService) {}
 
   @Put('vehicle')
-  upsertVehicle(
-    @CurrentUser() jwtUser: AuthenticatedUser,
-    @Body() dto: UpsertDriverVehicleDto,
-  ) {
+  upsertVehicle(@CurrentUser() jwtUser: AuthenticatedUser, @Body() dto: UpsertDriverVehicleDto) {
     return this.drivers.upsertVehicle(jwtUser.id, dto);
   }
 
   @Put('zones')
-  upsertZones(
-    @CurrentUser() jwtUser: AuthenticatedUser,
-    @Body() dto: UpsertDriverZonesDto,
-  ) {
+  upsertZones(@CurrentUser() jwtUser: AuthenticatedUser, @Body() dto: UpsertDriverZonesDto) {
     return this.drivers.upsertZones(jwtUser.id, dto);
   }
 }

@@ -6,7 +6,6 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
-import type { Review, ReviewCriterionRating, User } from '@prisma/client';
 
 import { OrderStatus } from '@common/enums/order-status.enum';
 import {
@@ -20,10 +19,9 @@ import { PrismaService } from '@infrastructure/database/prisma.service';
 
 import { CreateReviewCriterionDto } from './dto/create-review-criterion.dto';
 import { CreateReviewDto } from './dto/create-review.dto';
-import {
-  CriterionRatingAggregate,
-  SellerStatsResponseDto,
-} from './dto/seller-stats-response.dto';
+import { CriterionRatingAggregate, SellerStatsResponseDto } from './dto/seller-stats-response.dto';
+
+import type { Review, ReviewCriterionRating, User } from '@prisma/client';
 
 type ReviewWithRelations = Review & {
   author: User;
@@ -249,13 +247,13 @@ function validateCriteriaValues(ratings: CreateReviewCriterionDto[]): void {
   for (const r of ratings) {
     const valueType = RATING_CRITERION_VALUE_TYPE[r.criterion as RatingCriterion];
     if (valueType === RatingValueType.Score5 && (r.value < 0 || r.value > 5)) {
-      throw new BadRequestException(
-        `Criterion ${r.criterion} expects a score 0–5; got ${r.value}`,
-      );
+      throw new BadRequestException(`Criterion ${r.criterion} expects a score 0–5; got ${r.value}`);
     }
-    if (valueType === RatingValueType.Percent && (r.value < 0 || r.value > 100)) {
+    // Percent criteria (hygiene) are BINARY per the client spec: 0 or 100,
+    // nothing in between (e.g. 47.5 / 50 are rejected).
+    if (valueType === RatingValueType.Percent && r.value !== 0 && r.value !== 100) {
       throw new BadRequestException(
-        `Criterion ${r.criterion} expects a percent 0–100; got ${r.value}`,
+        `Criterion ${r.criterion} is binary — expects 0 or 100; got ${r.value}`,
       );
     }
   }

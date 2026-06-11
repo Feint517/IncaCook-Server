@@ -42,11 +42,23 @@ export const envSchema = z.object({
   // onboarding service rejects requests if either is empty.
   STRIPE_ONBOARDING_RETURN_URL: z.union([z.literal(''), z.string().url()]).default(''),
   STRIPE_ONBOARDING_REFRESH_URL: z.union([z.literal(''), z.string().url()]).default(''),
+  // Seller subscription ($4/mo). Price id of the recurring Stripe Price;
+  // the success/cancel/portal URLs Stripe redirects to. Optional at boot
+  // so the server starts before they're configured; the subscription
+  // service rejects checkout/portal requests if the price id is empty.
+  STRIPE_SELLER_SUBSCRIPTION_PRICE_ID: z.string().optional().default(''),
+  STRIPE_SUBSCRIPTION_SUCCESS_URL: z.union([z.literal(''), z.string().url()]).default(''),
+  STRIPE_SUBSCRIPTION_CANCEL_URL: z.union([z.literal(''), z.string().url()]).default(''),
+  STRIPE_PORTAL_RETURN_URL: z.union([z.literal(''), z.string().url()]).default(''),
 
   // Twilio
   TWILIO_ACCOUNT_SID: z.string().optional().default(''),
   TWILIO_AUTH_TOKEN: z.string().optional().default(''),
   TWILIO_PHONE_NUMBER: z.string().optional().default(''),
+
+  // Prelude Verify (phone OTP provider)
+  PRELUDE_API_KEY: z.string().optional().default(''),
+  PRELUDE_BASE_URL: z.string().optional().default('https://api.prelude.dev/v2'),
 
   // Firebase
   FIREBASE_PROJECT_ID: z.string().optional().default(''),

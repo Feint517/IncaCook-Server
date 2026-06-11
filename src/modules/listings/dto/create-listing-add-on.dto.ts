@@ -7,7 +7,9 @@ import { IsBoolean, IsInt, IsOptional, IsString, MaxLength, MinLength } from 'cl
  * `priceDeltaCents` can be negative ("no cheese: -50¢").
  */
 export class CreateListingAddOnDto {
-  @IsString() @MinLength(1) @MaxLength(120)
+  @IsString()
+  @MinLength(1)
+  @MaxLength(120)
   label!: string;
 
   @IsInt()

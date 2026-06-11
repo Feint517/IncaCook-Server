@@ -1,5 +1,5 @@
-import { IsDateString, IsEnum, IsOptional } from 'class-validator';
 import { DriverVehicleType } from '@prisma/client';
+import { IsDateString, IsEnum, IsOptional } from 'class-validator';
 
 /**
  * Body for `PUT /v1/drivers/me/vehicle`. Sets vehicleType and (optionally)

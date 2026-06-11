@@ -238,6 +238,12 @@ otp_expiry = 3600
 # admin_email = "admin@email.com"
 # sender_name = "Admin"
 
+# Forgot-password flow sends a 6-digit code (no link). The template renders
+# {{ .Token }} only; pair with POST /v1/auth/password/verify-reset-otp.
+[auth.email.template.recovery]
+subject = "Your IncaCook password reset code"
+content_path = "./supabase/templates/recovery.html"
+
 # Uncomment to customize email template
 # [auth.email.template.invite]
 # subject = "You have been invited"

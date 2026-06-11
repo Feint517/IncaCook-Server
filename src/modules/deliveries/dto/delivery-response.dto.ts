@@ -1,14 +1,33 @@
-import type { Delivery, Order } from '@prisma/client';
 import { DeliveryStatus, OrderStatus } from '@prisma/client';
 
+import type { Delivery, Order } from '@prisma/client';
+
 /**
- * What the driver sees. Slim — driver app doesn't need OrderItem detail
- * up front; that comes via a separate `GET /v1/orders/:id` call when the
- * driver taps in for full info.
- *
- * For "available" deliveries (SEARCHING), the driver gets enough to
- * decide whether to claim: orderNumber, fulfillmentFee (their pay),
- * dropoff city/postcode, and the seller's neighborhood.
+ * Optional enrichment overlay used by `listAvailable` so the driver
+ * app's incoming-order modal can render real seller/dropoff names,
+ * and the map can route to the real pickup point. PostGIS coords are
+ * fetched via raw SQL (Prisma can't `select` `Unsupported(geography)`).
+ */
+export interface DeliveryEnrichment {
+  pickupLat: number | null;
+  pickupLng: number | null;
+  pickupFullAddress: string | null;
+  dropoffLat: number | null;
+  dropoffLng: number | null;
+  dropoffFullAddress: string;
+  sellerName: string | null;
+  /** Buyer's display name — who the driver hands the food to at dropoff. */
+  recipientName: string | null;
+  orderTotalCents: number;
+  placedAt: Date;
+  itemCount: number;
+}
+
+/**
+ * What the driver sees. The first 14 fields are always present; the
+ * trailing enrichment block (sellerName, pickup/dropoff lat-lng,
+ * full address, total, item count) is only populated by
+ * `listAvailable` — other delivery endpoints leave those null.
  */
 export class DeliveryResponseDto {
   id!: string;
@@ -26,6 +45,19 @@ export class DeliveryResponseDto {
   dropoffCity!: string;
   dropoffPostalCode!: string;
 
+  // Enrichment (null on endpoints that don't populate them).
+  pickupLat!: number | null;
+  pickupLng!: number | null;
+  pickupFullAddress!: string | null;
+  dropoffLat!: number | null;
+  dropoffLng!: number | null;
+  dropoffFullAddress!: string | null;
+  sellerName!: string | null;
+  recipientName!: string | null;
+  orderTotalCents!: number | null;
+  placedAt!: Date | null;
+  itemCount!: number | null;
+
   driverAssignedAt!: Date | null;
   pickedUpAt!: Date | null;
   deliveredAt!: Date | null;
@@ -35,14 +67,12 @@ export class DeliveryResponseDto {
 
   static from(
     row: Delivery & {
-      order: Pick<
-        Order,
-        'orderNumber' | 'status' | 'fulfillmentFeeCents'
-      > & {
+      order: Pick<Order, 'orderNumber' | 'status' | 'fulfillmentFeeCents'> & {
         seller: { neighborhood: string | null };
-        dropoffAddress: { city: string; postalCode: string };
+        dropoffAddress: { city: string; postalCode: string } | null;
       };
     },
+    enrichment?: DeliveryEnrichment,
   ): DeliveryResponseDto {
     return {
       id: row.id,
@@ -53,8 +83,19 @@ export class DeliveryResponseDto {
       driverId: row.driverId,
       driverPayoutCents: row.order.fulfillmentFeeCents,
       pickupNeighborhood: row.order.seller.neighborhood,
-      dropoffCity: row.order.dropoffAddress.city,
-      dropoffPostalCode: row.order.dropoffAddress.postalCode,
+      dropoffCity: row.order.dropoffAddress?.city ?? '',
+      dropoffPostalCode: row.order.dropoffAddress?.postalCode ?? '',
+      pickupLat: enrichment?.pickupLat ?? null,
+      pickupLng: enrichment?.pickupLng ?? null,
+      pickupFullAddress: enrichment?.pickupFullAddress ?? null,
+      dropoffLat: enrichment?.dropoffLat ?? null,
+      dropoffLng: enrichment?.dropoffLng ?? null,
+      dropoffFullAddress: enrichment?.dropoffFullAddress ?? null,
+      sellerName: enrichment?.sellerName ?? null,
+      recipientName: enrichment?.recipientName ?? null,
+      orderTotalCents: enrichment?.orderTotalCents ?? null,
+      placedAt: enrichment?.placedAt ?? null,
+      itemCount: enrichment?.itemCount ?? null,
       driverAssignedAt: row.driverAssignedAt,
       pickedUpAt: row.pickedUpAt,
       deliveredAt: row.deliveredAt,

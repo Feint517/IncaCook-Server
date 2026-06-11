@@ -1,5 +1,5 @@
-import { IsEnum, IsOptional, IsString, MaxLength, MinLength } from 'class-validator';
 import { KycDocType } from '@prisma/client';
+import { IsEnum, IsOptional, IsString, MaxLength, MinLength } from 'class-validator';
 
 import { IdDocumentType } from '@common/enums/id-document-type.enum';
 
@@ -20,7 +20,9 @@ export class UpsertKycDocumentDto {
   @IsEnum(KycDocType)
   type!: KycDocType;
 
-  @IsString() @MinLength(1) @MaxLength(500)
+  @IsString()
+  @MinLength(1)
+  @MaxLength(500)
   fileUrl!: string;
 
   @IsOptional()

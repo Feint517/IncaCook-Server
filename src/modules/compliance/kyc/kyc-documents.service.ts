@@ -4,7 +4,6 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import type { KycDocument } from '@prisma/client';
 import { KycDocType, KycStatus, Prisma } from '@prisma/client';
 
 import { DriverVehicleType, MOTORIZED_VEHICLES } from '@common/enums/driver-vehicle-type.enum';
@@ -15,6 +14,8 @@ import { generateUlid } from '@common/utils/code-generator.util';
 import { PrismaService } from '@infrastructure/database/prisma.service';
 
 import { UpsertKycDocumentDto } from './dto/upsert-kyc-document.dto';
+
+import type { KycDocument } from '@prisma/client';
 
 /** Doc slots that are role-gated. Everything not listed is open to both. */
 const SELLER_ALLOWED: ReadonlySet<KycDocType> = new Set([
@@ -79,7 +80,10 @@ export class KycDocumentsService {
 
     // ID_FRONT / ID_BACK rows carry the kind of ID in metadata; the Flutter
     // app is expected to send it (the wizard collects it on the ID screen).
-    if ((dto.type === KycDocType.ID_FRONT || dto.type === KycDocType.ID_BACK) && !dto.idDocumentType) {
+    if (
+      (dto.type === KycDocType.ID_FRONT || dto.type === KycDocType.ID_BACK) &&
+      !dto.idDocumentType
+    ) {
       throw new BadRequestException('idDocumentType is required for ID_FRONT / ID_BACK');
     }
 

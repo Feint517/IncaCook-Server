@@ -1,4 +1,11 @@
-import { ArrayMinSize, ArrayUnique, IsArray, IsString, MaxLength, MinLength } from 'class-validator';
+import {
+  ArrayMinSize,
+  ArrayUnique,
+  IsArray,
+  IsString,
+  MaxLength,
+  MinLength,
+} from 'class-validator';
 
 /**
  * Body for `PUT /v1/drivers/me/zones`. Replaces the driver's full set of

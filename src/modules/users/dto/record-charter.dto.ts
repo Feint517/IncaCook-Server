@@ -1,5 +1,5 @@
-import { IsEnum, IsString, MaxLength, MinLength } from 'class-validator';
 import { CharterKind } from '@prisma/client';
+import { IsEnum, IsString, MaxLength, MinLength } from 'class-validator';
 
 /**
  * Body for `POST /v1/users/me/charters`. Records that the caller accepted
@@ -10,6 +10,8 @@ export class RecordCharterDto {
   @IsEnum(CharterKind)
   charter!: CharterKind;
 
-  @IsString() @MinLength(1) @MaxLength(20)
+  @IsString()
+  @MinLength(1)
+  @MaxLength(20)
   version!: string;
 }

@@ -1,9 +1,9 @@
-import type { DriverProfile } from '@prisma/client';
-
 import { DriverVehicleType } from '@common/enums/driver-vehicle-type.enum';
 import { KycStatus } from '@common/enums/kyc-status.enum';
 
 import { AddressResponseDto } from './address-response.dto';
+
+import type { DriverProfile } from '@prisma/client';
 
 /**
  * Returned to the driver themselves on `GET /v1/users/me`. After Phase A

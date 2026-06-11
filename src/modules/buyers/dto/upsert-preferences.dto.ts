@@ -1,5 +1,5 @@
-import { ArrayUnique, IsArray, IsEnum } from 'class-validator';
 import { Allergen, DietaryTag } from '@prisma/client';
+import { ArrayUnique, IsArray, IsEnum } from 'class-validator';
 
 /**
  * Body for `PUT /v1/buyers/me/preferences`. Idempotent replace —

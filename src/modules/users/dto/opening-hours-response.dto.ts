@@ -1,6 +1,6 @@
-import type { SellerOpeningHours } from '@prisma/client';
-
 import { DayOfWeek } from '@common/enums/day-of-week.enum';
+
+import type { SellerOpeningHours } from '@prisma/client';
 
 export class OpeningHoursResponseDto {
   dayOfWeek!: DayOfWeek;

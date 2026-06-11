@@ -18,10 +18,13 @@ export class CreateOrderItemDto {
   @IsString()
   listingId!: string;
 
-  @IsInt() @Min(1)
+  @IsInt()
+  @Min(1)
   quantity!: number;
 
-  @IsOptional() @IsString() @MaxLength(500)
+  @IsOptional()
+  @IsString()
+  @MaxLength(500)
   note?: string;
 
   @IsOptional()
