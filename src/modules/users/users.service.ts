@@ -312,7 +312,7 @@ export class UsersService {
             data: {
               fullAddress: dto.fullAddress,
               city: dto.city,
-              postalCode: dto.postalCode,
+              postalCode: dto.postalCode || null,
               type: dto.type ?? null,
               customLabel: dto.customLabel ?? null,
               apartment: dto.apartment ?? null,
@@ -328,7 +328,7 @@ export class UsersService {
               kind,
               fullAddress: dto.fullAddress,
               city: dto.city,
-              postalCode: dto.postalCode,
+              postalCode: dto.postalCode || null,
               type: dto.type ?? null,
               customLabel: dto.customLabel ?? null,
               apartment: dto.apartment ?? null,

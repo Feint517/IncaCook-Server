@@ -46,7 +46,7 @@ type DeliveryWithRelations = Delivery & {
     // Nullable on the Order model (PICKUP orders carry no dropoff), but in
     // practice always present here — deliveries are only created for
     // DELIVERY orders. Typed nullable to match Prisma; readers coalesce.
-    dropoffAddress: { city: string; postalCode: string } | null;
+    dropoffAddress: { city: string; postalCode: string | null } | null;
   };
 };
 

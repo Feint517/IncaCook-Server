@@ -69,7 +69,7 @@ export class DeliveryResponseDto {
     row: Delivery & {
       order: Pick<Order, 'orderNumber' | 'status' | 'fulfillmentFeeCents'> & {
         seller: { neighborhood: string | null };
-        dropoffAddress: { city: string; postalCode: string } | null;
+        dropoffAddress: { city: string; postalCode: string | null } | null;
       };
     },
     enrichment?: DeliveryEnrichment,

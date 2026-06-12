@@ -30,10 +30,12 @@ export class UpsertAddressDto {
   @MaxLength(120)
   city!: string;
 
+  // Optional: not every place (town-level results, some non-FR addresses)
+  // carries a postcode. Empty/absent is allowed and stored as null.
+  @IsOptional()
   @IsString()
-  @MinLength(1)
   @MaxLength(20)
-  postalCode!: string;
+  postalCode?: string;
 
   @IsOptional()
   @IsEnum(SavedAddressType)

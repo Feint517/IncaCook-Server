@@ -493,7 +493,8 @@ model Address {
 
   fullAddress String
   city        String
-  postalCode  String
+  // Nullable: some places (town-level / non-FR results) carry no postcode.
+  postalCode  String?
 
   // PostGIS geography(Point, 4326). Written via raw SQL (`ST_MakePoint`).
   // GIST index added in the migration for radius queries.

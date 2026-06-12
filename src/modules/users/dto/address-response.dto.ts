@@ -25,7 +25,9 @@ export class AddressResponseDto {
       customLabel: address.customLabel,
       fullAddress: address.fullAddress,
       city: address.city,
-      postalCode: address.postalCode,
+      // Column is now nullable; surface '' so the Flutter Address model
+      // (non-null postalCode) keeps parsing without a breaking change.
+      postalCode: address.postalCode ?? '',
       apartment: address.apartment,
       floor: address.floor,
       digicode: address.digicode,
