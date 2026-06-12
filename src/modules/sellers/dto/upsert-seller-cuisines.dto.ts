@@ -13,8 +13,10 @@ export class UpsertSellerCuisinesDto {
   @IsEnum(CuisineType, { each: true })
   cuisines!: CuisineType[];
 
+  // Dish types apply only to traiteur/restaurant; fait-maison sellers have
+  // none, so an empty list is valid here. The "≥1 for traiteur/restaurant"
+  // rule is enforced in the service, which knows the seller's category.
   @IsArray()
-  @ArrayMinSize(1, { message: 'At least one dish type is required' })
   @ArrayUnique()
   @IsEnum(DishType, { each: true })
   dishTypes!: DishType[];

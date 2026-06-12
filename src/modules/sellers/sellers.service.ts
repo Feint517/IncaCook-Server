@@ -192,6 +192,21 @@ export class SellersService {
   ): Promise<{ cuisines: CuisineType[]; dishTypes: DishType[] }> {
     const userId = await this.assertSeller(supabaseId);
 
+    // Dish types only apply to traiteur/restaurant. Fait-maison (or an unset
+    // category, which defaults to fait-maison) has none — so an empty list is
+    // fine there and any sent dish types are ignored. Traiteur/restaurant must
+    // pick at least one.
+    const profile = await this.prisma.db.sellerProfile.findUnique({
+      where: { userId },
+      select: { category: true },
+    });
+    const isFaitMaison =
+      profile?.category == null || profile.category === SellerCategory.FAIT_MAISON;
+    if (!isFaitMaison && dto.dishTypes.length === 0) {
+      throw new BadRequestException('At least one dish type is required');
+    }
+    const dishTypes = isFaitMaison ? [] : dto.dishTypes;
+
     return this.prisma.$transaction(async (tx) => {
       await tx.sellerCuisine.deleteMany({ where: { userId } });
       await tx.sellerDish.deleteMany({ where: { userId } });
@@ -199,9 +214,9 @@ export class SellersService {
         data: dto.cuisines.map((cuisineType) => ({ userId, cuisineType })),
       });
       await tx.sellerDish.createMany({
-        data: dto.dishTypes.map((dishType) => ({ userId, dishType })),
+        data: dishTypes.map((dishType) => ({ userId, dishType })),
       });
-      return { cuisines: dto.cuisines, dishTypes: dto.dishTypes };
+      return { cuisines: dto.cuisines, dishTypes };
     });
   }
 
