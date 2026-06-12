@@ -220,6 +220,13 @@ export class UsersService {
     const supabaseUser = await this.admin.client.auth.admin.getUserById(identity.supabaseId);
     const emailVerified = supabaseUser.data.user?.email_confirmed_at != null;
     const phoneVerified = supabaseUser.data.user?.phone_confirmed_at != null;
+    // Prefer the phone from the fresh Supabase user: the OTP step sets it there
+    // (via admin) after the current JWT was issued, so `identity.phone` (a JWT
+    // claim) is stale. Supabase stores E.164 without '+', so re-add it.
+    const supabasePhone = supabaseUser.data.user?.phone;
+    const phone = supabasePhone
+      ? `+${supabasePhone.replace(/^\+/, '')}`
+      : (identity.phone ?? null);
 
     await this.prisma.$transaction(async (tx) => {
       await tx.user.create({
@@ -227,7 +234,7 @@ export class UsersService {
           id: userId,
           supabaseId: identity.supabaseId,
           email: identity.email!,
-          phone: identity.phone ?? null,
+          phone,
           role: dto.role,
           firstName: dto.firstName,
           lastName: dto.lastName,

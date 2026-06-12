@@ -267,8 +267,27 @@ export class AuthService {
     }
 
     await this.assertPhoneAvailable(supabaseId, phone);
+
+    // Persist the verified phone on the Supabase auth user — the source of
+    // truth that always exists post-auth. [UsersService.createFromJwt] (Gate 2)
+    // mirrors `phone` + `phone_confirmed_at` onto the User row when it's
+    // created, so this works whether or not the local row exists yet. The
+    // Google / NoProfile path verifies the phone *before* Gate 2, so writing to
+    // the (absent) Prisma row here used to 404 with P2025. Supabase stores
+    // E.164 without the leading '+'.
+    const { error } = await this.admin.client.auth.admin.updateUserById(supabaseId, {
+      phone: phone.replace(/^\+/, ''),
+      phone_confirm: true,
+    });
+    if (error) {
+      throw this.toHttpException(error, 'phone verification failed');
+    }
+
+    // Keep the local row in sync when it already exists (re-verification after
+    // Gate 2). `updateMany` is a no-op (count 0) when the row isn't there yet,
+    // so the pre-Gate-2 path no longer throws P2025.
     try {
-      await this.prisma.db.user.update({
+      await this.prisma.db.user.updateMany({
         where: { supabaseId },
         data: { phone, phoneVerified: true },
       });
