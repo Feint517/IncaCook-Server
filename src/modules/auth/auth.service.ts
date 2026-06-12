@@ -6,6 +6,7 @@ import {
   Injectable,
   InternalServerErrorException,
   Logger,
+  ServiceUnavailableException,
   UnauthorizedException,
 } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
@@ -244,7 +245,16 @@ export class AuthService {
    */
   async requestPhoneOtp(supabaseId: string, phone: string): Promise<void> {
     await this.assertPhoneAvailable(supabaseId, phone);
-    await this.prelude.sendPhoneOtp(phone);
+    const { status } = await this.prelude.sendPhoneOtp(phone);
+    // Prelude statuses: 'success'/'retry' = OTP dispatched; anything else
+    // ('blocked', 'shadow_blocked', 'unknown', …) means no SMS was sent — fail
+    // loudly instead of advancing the wizard to a code screen that can't work.
+    this.logger.log(`Prelude send status=${status}`);
+    if (status !== 'success' && status !== 'retry') {
+      throw new ServiceUnavailableException(
+        "L'envoi du SMS a échoué (numéro non pris en charge ou bloqué). Vérifiez le numéro et réessayez.",
+      );
+    }
   }
 
   /**
