@@ -44,6 +44,9 @@ type Tx = Prisma.TransactionClient;
 /** Premium sellers pay 25%, everyone else 30%. Mirrors the env defaults. */
 const COMMISSION_RATE_BPS_STANDARD = 3000;
 const COMMISSION_RATE_BPS_PREMIUM = 2500;
+// Commission floor: 1 € (100 cents) per the client spec — commission is
+// never less than this regardless of subtotal × rate.
+const COMMISSION_MIN_CENTS = 100;
 
 @Injectable()
 export class OrdersService {
