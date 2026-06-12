@@ -11,6 +11,7 @@ import { UserRole } from '@common/enums/user-role.enum';
 
 import { PrismaService } from '@infrastructure/database/prisma.service';
 
+import { KitchenSummaryDto } from './dto/kitchen-summary.dto';
 import { UpsertSellerBusinessDto } from './dto/upsert-seller-business.dto';
 import { UpsertSellerCuisinesDto } from './dto/upsert-seller-cuisines.dto';
 import { UpsertSellerProfileDto } from './dto/upsert-seller-profile.dto';
@@ -34,6 +35,26 @@ const DEFAULT_DELIVERY_FEE_CENTS = 250;
 @Injectable()
 export class SellersService {
   constructor(private readonly prisma: PrismaService) {}
+
+  // -------------------- Buyer-facing feed --------------------
+
+  /**
+   * "Kitchens near you" — active sellers that have set up a profile
+   * (`displayName` present) on a non-deleted user. Ordered by rating then
+   * review count. Distance filtering is a follow-up; v1 returns the top set.
+   */
+  async listKitchens(): Promise<KitchenSummaryDto[]> {
+    const sellers = await this.prisma.db.sellerProfile.findMany({
+      where: {
+        displayName: { not: null },
+        user: { deletedAt: null },
+      },
+      include: { cuisines: true },
+      orderBy: [{ averageRating: { sort: 'desc', nulls: 'last' } }, { reviewCount: 'desc' }],
+      take: 50,
+    });
+    return sellers.map((s) => KitchenSummaryDto.from(s));
+  }
 
   // -------------------- Profile --------------------
 
