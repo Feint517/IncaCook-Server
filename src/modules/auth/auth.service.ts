@@ -84,18 +84,17 @@ export class AuthService {
    * to commit role + name + CGU, just like email signup.
    */
   async signInWithGoogle(idToken: string, nonce?: string): Promise<SessionResponseDto> {
-    // The native Google Sign-In iOS SDK embeds a `nonce` claim in the ID
-    // token, but the Flutter `google_sign_in` plugin never surfaces the raw
-    // value, so the client can't forward it. Supabase rejects a token that
-    // carries a nonce unless a matching `nonce` is passed alongside it
-    // ("Passed nonce and nonce in id_token should either both exist or not").
-    // Recover it from the token: GoTrue accepts a raw nonce equal to the
-    // token's claim. Android tokens carry no nonce, so this is a no-op there.
-    const effectiveNonce = nonce ?? this.extractNonceClaim(idToken);
+    // The native Google Sign-In iOS SDK embeds a nonce claim in the ID token
+    // whose raw value the Flutter plugin never surfaces, so we can't forward a
+    // matching nonce here. The Google provider is configured with
+    // `skip_nonce_check = true` (see supabase/config.toml + the hosted
+    // project's auth settings), which lets `signInWithIdToken` accept the
+    // token without nonce validation. `nonce` is therefore optional and only
+    // forwarded if a future call site embeds a controllable hashed nonce.
     const { data, error } = await this.anon.client.auth.signInWithIdToken({
       provider: 'google',
       token: idToken,
-      ...(effectiveNonce ? { nonce: effectiveNonce } : {}),
+      ...(nonce ? { nonce } : {}),
     });
     if (error || !data.session) {
       throw this.toHttpException(
@@ -104,25 +103,6 @@ export class AuthService {
       );
     }
     return this.toSession(data.session);
-  }
-
-  /**
-   * Reads the `nonce` claim from a Google ID token without verifying its
-   * signature — Supabase's `signInWithIdToken` does the real verification.
-   * Returns undefined when the token is malformed or carries no nonce (the
-   * Android flow), so the caller simply omits the nonce in that case.
-   */
-  private extractNonceClaim(idToken: string): string | undefined {
-    try {
-      const payload = idToken.split('.')[1];
-      if (!payload) return undefined;
-      const claims = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as {
-        nonce?: string;
-      };
-      return claims.nonce;
-    } catch {
-      return undefined;
-    }
   }
 
   async refresh(refreshToken: string): Promise<SessionResponseDto> {
