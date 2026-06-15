@@ -113,6 +113,17 @@ export class AllExceptionsFilter implements ExceptionFilter {
       return this.fromPrisma(exception, base);
     }
 
+    // Malformed query / enum mismatch / wrong field type → client error, not 500.
+    if (exception instanceof Prisma.PrismaClientValidationError) {
+      return {
+        ...base,
+        statusCode: HttpStatus.BAD_REQUEST,
+        message: 'Données invalides : un ou plusieurs champs ne respectent pas le format attendu.',
+        error: 'Bad Request',
+        code: ErrorCodes.ValidationFailed,
+      };
+    }
+
     return {
       ...base,
       statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
@@ -142,6 +153,31 @@ export class AllExceptionsFilter implements ExceptionFilter {
           message: 'Resource not found',
           error: 'Not Found',
           code: ErrorCodes.NotFound,
+        };
+      // Constraint violations are bad client input, not server faults → 400.
+      case 'P2003':
+        return {
+          ...base,
+          statusCode: HttpStatus.BAD_REQUEST,
+          message: 'Référence invalide : une entité liée est introuvable.',
+          error: 'Bad Request',
+          code: ErrorCodes.ValidationFailed,
+        };
+      case 'P2000':
+        return {
+          ...base,
+          statusCode: HttpStatus.BAD_REQUEST,
+          message: 'Une valeur dépasse la longueur maximale autorisée.',
+          error: 'Bad Request',
+          code: ErrorCodes.ValidationFailed,
+        };
+      case 'P2011':
+        return {
+          ...base,
+          statusCode: HttpStatus.BAD_REQUEST,
+          message: 'Un champ obligatoire est manquant.',
+          error: 'Bad Request',
+          code: ErrorCodes.ValidationFailed,
         };
       default:
         return {

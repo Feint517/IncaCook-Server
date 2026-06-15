@@ -582,6 +582,30 @@ model UserCharter {
   @@index([userId, charter, acceptedAt(sort: Desc)])
 }
 
+model LegalDocument {
+  // Admin-editable CGU/CGV documents. The active row per kind is the canonical
+  // published text the mobile app shows and that publish/purchase acceptance is
+  // recorded against (see record-terms-acceptance.util.ts). Drafts
+  // (isActive=false) are editable; publishing flips exactly one active row per
+  // kind and notifies users. Reuses CharterKind (only CGU/CGV are managed here)
+  // so acceptance keeps flowing through the existing UserCharter ledger.
+  id          String      @id
+  kind        CharterKind
+  version     String
+  title       String
+  content     String
+  isActive    Boolean     @default(false)
+  publishedAt DateTime?
+  // Audit: local User.id of the admin who created / last edited the row.
+  createdBy   String?
+  updatedBy   String?
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  @@unique([kind, version])
+  @@index([kind, isActive])
+}
+
 model KycDocument {
   // One row per uploaded document. Unique on (userId, type): a new upload
   // for the same slot supersedes the previous (older fileUrl is overwritten

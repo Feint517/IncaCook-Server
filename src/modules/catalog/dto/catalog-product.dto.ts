@@ -5,6 +5,7 @@ import {
   IsInt,
   IsOptional,
   IsString,
+  IsUrl,
   Length,
   Min,
 } from 'class-validator';
@@ -24,8 +25,8 @@ export class CreateCatalogProductDto {
 
   @IsOptional()
   @IsArray()
-  @IsString({ each: true })
   @ArrayMaxSize(6)
+  @IsUrl({}, { each: true, message: 'Chaque image doit être une URL valide (https://…).' })
   imageUrls?: string[];
 
   @IsInt()
@@ -56,8 +57,8 @@ export class UpdateCatalogProductDto {
 
   @IsOptional()
   @IsArray()
-  @IsString({ each: true })
   @ArrayMaxSize(6)
+  @IsUrl({}, { each: true, message: 'Chaque image doit être une URL valide (https://…).' })
   imageUrls?: string[];
 
   @IsOptional()

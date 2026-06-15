@@ -14,7 +14,17 @@ import { CreateCatalogProductDto, UpdateCatalogProductDto } from './dto/catalog-
 export class CatalogAdminService {
   constructor(private readonly prisma: PrismaService) {}
 
-  async create(adminId: string, dto: CreateCatalogProductDto) {
+  async create(adminSupabaseId: string, dto: CreateCatalogProductDto) {
+    // `createdById` is a FK to User.id (a ULID). The JWT carries the Supabase
+    // UUID, so we must resolve the admin's local User.id first — passing the
+    // Supabase id straight through violates the FK and surfaces as a 500.
+    const admin = await this.prisma.db.user.findUnique({
+      where: { supabaseId: adminSupabaseId },
+      select: { id: true },
+    });
+    if (!admin) {
+      throw new NotFoundException('Compte administrateur introuvable.');
+    }
     return this.prisma.db.catalogProduct.create({
       data: {
         id: generateUlid(),
@@ -22,9 +32,9 @@ export class CatalogAdminService {
         description: dto.description ?? null,
         imageUrls: dto.imageUrls ?? [],
         priceCents: dto.priceCents,
-        currency: (dto.currency ?? 'usd').toLowerCase(),
+        currency: (dto.currency ?? 'eur').toLowerCase(),
         isActive: dto.isActive ?? true,
-        createdById: adminId,
+        createdById: admin.id,
       },
     });
   }
