@@ -1,12 +1,16 @@
 import {
   BadRequestException,
   ConflictException,
+  HttpStatus,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { AddressKind, UserCharter } from '@prisma/client';
 
+import { ErrorCodes } from '@common/constants/error-codes.constants';
 import { UserRole } from '@common/enums/user-role.enum';
+import { DomainException } from '@common/exceptions/domain.exception';
 import { generateUlid } from '@common/utils/code-generator.util';
 
 import { PrismaService } from '@infrastructure/database/prisma.service';
@@ -84,10 +88,53 @@ export interface UserAggregate {
 
 @Injectable()
 export class UsersService {
+  private readonly logger = new Logger(UsersService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly admin: SupabaseAdminService,
   ) {}
+
+  /**
+   * Resolves the user's email, in priority order, WITHOUT trusting a raw
+   * client-supplied value:
+   *   1. the JWT `email` claim,
+   *   2. `user_metadata.email` (set by the OAuth provider),
+   *   3. an identity's `identity_data.email` (provider identity),
+   *   4. a verified email on the auth user (`email` + `email_confirmed_at`,
+   *      e.g. set by our email-OTP add-email flow).
+   * Returns `{ email: null }` when none is available so the caller can ask the
+   * user to add + verify one. `source` is logged (never the value).
+   */
+  private pickEmail(
+    jwtEmail: string | undefined,
+    authUser: {
+      email?: string | null;
+      email_confirmed_at?: string | null;
+      user_metadata?: Record<string, unknown> | null;
+      identities?: Array<{ identity_data?: Record<string, unknown> | null }> | null;
+    } | null,
+  ): { email: string | null; source: string } {
+    const clean = (v: unknown): string | null =>
+      typeof v === 'string' && v.includes('@') ? v : null;
+
+    if (jwtEmail) return { email: jwtEmail, source: 'jwt' };
+
+    const metaEmail = clean(authUser?.user_metadata?.email);
+    if (metaEmail) return { email: metaEmail, source: 'user_metadata' };
+
+    for (const identity of authUser?.identities ?? []) {
+      const idEmail = clean(identity.identity_data?.email);
+      if (idEmail) return { email: idEmail, source: 'identity_data' };
+    }
+
+    // Only an email that has actually been confirmed counts as "verified".
+    if (authUser?.email && authUser.email_confirmed_at) {
+      return { email: authUser.email, source: 'verified' };
+    }
+
+    return { email: null, source: 'none' };
+  }
 
   async findBySupabaseId(supabaseId: string): Promise<UserAggregate> {
     const user = await this.prisma.db.user.findUnique({
@@ -200,10 +247,6 @@ export class UsersService {
    * via per-concept PUT endpoints (Phase B).
    */
   async createFromJwt(identity: JwtIdentity, dto: CreateUserDto): Promise<UserAggregate> {
-    if (!identity.email) {
-      throw new BadRequestException('Email claim missing from token');
-    }
-
     const existing = await this.prisma.db.user.findUnique({
       where: { supabaseId: identity.supabaseId },
     });
@@ -211,29 +254,65 @@ export class UsersService {
       throw new ConflictException('User profile already exists');
     }
 
-    const userId = generateUlid();
-
     // Mirror Supabase's verification state. Email and phone are tracked
     // independently: emailVerified reflects email_confirmed_at (set by signup
     // / email OTP), phoneVerified reflects phone_confirmed_at (set only by the
     // phone OTP flow).
     const supabaseUser = await this.admin.client.auth.admin.getUserById(identity.supabaseId);
-    const emailVerified = supabaseUser.data.user?.email_confirmed_at != null;
-    const phoneVerified = supabaseUser.data.user?.phone_confirmed_at != null;
+    const authUser = supabaseUser.data.user;
+
+    // Resolve the email (jwt → user_metadata → identity_data → verified). An
+    // OAuth provider (e.g. Facebook) can omit the top-level claim, so we fall
+    // back to the provider metadata / a previously OTP-verified address before
+    // refusing. Never trust a raw client-supplied email.
+    const { email, source } = this.pickEmail(identity.email, authUser);
+    this.logger.log(`createFromJwt: email source=${source}`);
+    if (!email) {
+      throw new DomainException(
+        ErrorCodes.EmailRequired,
+        'Veuillez ajouter et vérifier votre adresse email.',
+        HttpStatus.FORBIDDEN,
+      );
+    }
+
+    // Reject the case where another Supabase identity already owns this email
+    // (e.g. the email originally signed up with password/Google and Supabase
+    // identity-linking is off). Without this the `tx.user.create` below blows
+    // up with an opaque P2002 on the unique email index.
+    await this.assertEmailAvailableForIdentity(identity.supabaseId, email);
+
+    const userId = generateUlid();
+
+    const emailVerified = authUser?.email_confirmed_at != null;
+    const phoneVerified = authUser?.phone_confirmed_at != null;
     // Prefer the phone from the fresh Supabase user: the OTP step sets it there
     // (via admin) after the current JWT was issued, so `identity.phone` (a JWT
     // claim) is stale. Supabase stores E.164 without '+', so re-add it.
-    const supabasePhone = supabaseUser.data.user?.phone;
-    const phone = supabasePhone
-      ? `+${supabasePhone.replace(/^\+/, '')}`
-      : (identity.phone ?? null);
+    const supabasePhone = authUser?.phone;
+    let phone = supabasePhone ? `+${supabasePhone.replace(/^\+/, '')}` : (identity.phone ?? null);
+
+    // SMS verification skipped: persist the number typed during onboarding as
+    // UNVERIFIED (phoneVerified stays false) when Supabase has no confirmed
+    // phone. `User.phone` is @unique, so drop it silently if another account
+    // already owns it — a duplicate must never block account creation.
+    if (!phone && dto.phone) {
+      const taken = await this.prisma.db.user.findFirst({
+        where: { phone: dto.phone, NOT: { supabaseId: identity.supabaseId } },
+        select: { id: true },
+      });
+      if (taken) {
+        this.logger.warn('createFromJwt: typed phone already in use — saved as null');
+      } else {
+        phone = dto.phone;
+      }
+    }
 
     await this.prisma.$transaction(async (tx) => {
       await tx.user.create({
         data: {
           id: userId,
           supabaseId: identity.supabaseId,
-          email: identity.email!,
+          email,
           phone,
           role: dto.role,
           firstName: dto.firstName,
@@ -259,6 +338,61 @@ export class UsersService {
     });
 
     return this.findBySupabaseId(identity.supabaseId);
+  }
+
+  /**
+   * Idempotent post-OAuth identity sync (POST /v1/auth/oauth/sync). The
+   * Supabase JWT has already been validated by the global guard; here we just
+   * answer "does this Supabase identity have an IncaCook profile yet?" and
+   * guard against an email collision so the caller can route accordingly:
+   *   - `hasProfile: true`  → returning user, full aggregate attached.
+   *   - `hasProfile: false` → first OAuth login; the client continues the
+   *     normal onboarding wizard (which calls `createFromJwt` / Gate 2).
+   *
+   * Does NOT create the row — onboarding owns that, since role + name + legal
+   * consent are required and aren't in the token. Preserves onboarding state.
+   */
+  async syncFromJwt(identity: JwtIdentity): Promise<{
+    hasProfile: boolean;
+    aggregate: UserAggregate | null;
+    email: string | null;
+    needsEmail: boolean;
+  }> {
+    const existing = await this.prisma.db.user.findUnique({
+      where: { supabaseId: identity.supabaseId },
+      select: { id: true },
+    });
+    if (existing) {
+      const aggregate = await this.findBySupabaseId(identity.supabaseId);
+      return { hasProfile: true, aggregate, email: aggregate.user.email, needsEmail: false };
+    }
+
+    // No profile yet — resolve the email so the client knows whether to show
+    // the "complete email" step before onboarding (Facebook may return none).
+    const supabaseUser = await this.admin.client.auth.admin.getUserById(identity.supabaseId);
+    const { email, source } = this.pickEmail(identity.email, supabaseUser.data.user);
+    this.logger.log(`syncFromJwt: profileExists=false email source=${source}`);
+    if (email) {
+      await this.assertEmailAvailableForIdentity(identity.supabaseId, email);
+    }
+    return { hasProfile: false, aggregate: null, email, needsEmail: email == null };
+  }
+
+  /**
+   * Rejects creating/linking a profile when a *different* Supabase identity
+   * already owns `email` (email is @unique). Shared by Gate 2 creation and
+   * the OAuth sync so "avoid duplicate users by email" holds on both paths.
+   */
+  private async assertEmailAvailableForIdentity(supabaseId: string, email: string): Promise<void> {
+    const owner = await this.prisma.db.user.findFirst({
+      where: { email, NOT: { supabaseId } },
+      select: { id: true },
+    });
+    if (owner) {
+      throw new ConflictException(
+        "Un compte existe déjà avec cette adresse e-mail. Connectez-vous avec votre méthode d'origine.",
+      );
+    }
   }
 
   // -------------------- Addresses --------------------

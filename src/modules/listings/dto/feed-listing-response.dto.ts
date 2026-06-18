@@ -16,7 +16,10 @@ import { ListingResponseDto } from './listing-response.dto';
  * lazily via `GET /v1/listings/:id` when the buyer taps in.
  */
 export class FeedListingResponseDto extends ListingResponseDto {
-  sellerName!: string;
+  // Feed always has a seller name (the visibility gate requires an APPROVED
+  // SellerProfile), so narrow the base's `string | null` to `string` here.
+  // `declare` keeps the narrowing without re-emitting a class field.
+  declare sellerName: string;
   distanceKm!: number | null;
   inRange!: boolean | null;
   rating!: number | null;

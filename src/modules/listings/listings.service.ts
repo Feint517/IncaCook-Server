@@ -87,6 +87,7 @@ export interface FeedRow {
   createdAt: Date;
   updatedAt: Date;
   sellerName: string;
+  sellerAvatarUrl: string | null;
   sellerRadiusKm: number;
   distanceKm: number | null;
   /** Seller pickup point (ST_Y/ST_X of SellerProfile.location). Null when the
@@ -138,15 +139,21 @@ export class ListingsService {
       throw new ForbiddenException('KYC_NOT_APPROVED');
     }
     // Mandatory platform subscription gate — blocks add / edit / publish
-    // when the seller's $4/mo subscription isn't active.
-    if (
-      opts.requireActiveSubscription &&
-      !isSubscriptionActive(
+    // when the seller's monthly subscription isn't active (date/status based).
+    if (opts.requireActiveSubscription) {
+      const active = isSubscriptionActive(
         user.sellerProfile.subscriptionStatus,
         user.sellerProfile.subscriptionCurrentPeriodEnd,
-      )
-    ) {
-      throw new ForbiddenException('SUBSCRIPTION_INACTIVE');
+      );
+      this.logger.log(
+        `[SubscriptionGate] seller=${user.id} ` +
+          `status=${user.sellerProfile.subscriptionStatus} ` +
+          `expiresAt=${user.sellerProfile.subscriptionCurrentPeriodEnd?.toISOString() ?? 'null'} ` +
+          `active=${active}`,
+      );
+      if (!active) {
+        throw new ForbiddenException('SUBSCRIPTION_INACTIVE');
+      }
     }
     return { sellerId: user.id, profile: user.sellerProfile };
   }
@@ -228,10 +235,12 @@ export class ListingsService {
     return created;
   }
 
-  async findById(id: string): Promise<ListingWithAddOns> {
+  async findById(id: string): Promise<ListingWithAddOns & { seller: SellerProfile }> {
     const listing = await this.prisma.db.listing.findUnique({
       where: { id },
-      include: { addOns: true },
+      // Load the seller relation so the detail response can carry the real
+      // seller name + avatar (the buyer product-detail screen renders them).
+      include: { addOns: true, seller: true },
     });
     if (!listing || listing.deletedAt !== null) {
       throw new NotFoundException('Listing not found');
@@ -504,6 +513,7 @@ export class ListingsService {
         l."createdAt",
         l."updatedAt",
         sp."displayName" AS "sellerName",
+        sp."profilePhotoUrl" AS "sellerAvatarUrl",
         sp."deliveryRadiusKm"::float8 AS "sellerRadiusKm",
         sp."averageRating" AS "rating",
         sp."reviewCount" AS "reviewCount",

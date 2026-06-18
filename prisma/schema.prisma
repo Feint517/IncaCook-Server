@@ -307,6 +307,8 @@ enum SubscriptionStatus {
   TRIALING
   PAST_DUE
   CANCELED
+  // Subscription lapsed (RevenueCat EXPIRATION event / past current period).
+  EXPIRED
   UNPAID
   INCOMPLETE
   INCOMPLETE_EXPIRED
@@ -399,6 +401,22 @@ model SellerProfile {
   // End of the current paid period ("subscriptionExpiresAt"). Active when
   // status ∈ {ACTIVE, TRIALING} AND this is in the future.
   subscriptionCurrentPeriodEnd DateTime?
+
+  // RevenueCat seller subscription (App Store / Google Play). The seller's
+  // monthly platform plan now runs through RevenueCat instead of Stripe
+  // Billing; these mirror the SAME `subscriptionStatus` /
+  // `subscriptionCurrentPeriodEnd` / `isPremium` gate fields above, so the
+  // listing-creation gate (isSubscriptionActive) and the commission tier
+  // (isPremium) need no change. Written optimistically by
+  // POST /v1/sellers/me/subscription/sync and reconciled authoritatively by
+  // the RevenueCat webhook. Stripe stays the source of truth for payouts,
+  // wallet and order payments — never for this subscription.
+  revenueCatCustomerId  String? // RevenueCat app_user_id (= our User.id)
+  revenueCatEntitlement String? // "seller_standard" | "seller_premium"
+  subscriptionPlan      String? // "STANDARD" | "PREMIUM"
+  subscriptionProductId String? // store product identifier
+  subscriptionCategory  SellerCategory? // category the plan was bought for
+  trialEndsAt           DateTime?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -1049,6 +1067,9 @@ model IdempotencyKey {
 enum ConversationType {
   BUYER_SELLER
   BUYER_DELIVERY
+  // Seller ↔ assigned driver, created when a delivery is claimed. One thread
+  // per order (pinned via Conversation.orderId).
+  SELLER_DRIVER
   SUPPORT
 }
 

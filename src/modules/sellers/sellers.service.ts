@@ -1,21 +1,38 @@
 import {
   BadRequestException,
   ForbiddenException,
+  Inject,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
-import { SellerCategory } from '@prisma/client';
+import { SellerCategory, SubscriptionStatus } from '@prisma/client';
 
+import { DELIVERY_FEE_CENTS } from '@common/constants/pricing.constants';
 import { maxRadiusForCategory } from '@common/constants/seller-radius.constants';
 import { UserRole } from '@common/enums/user-role.enum';
 
+import { revenueCatConfig } from '@config/revenuecat.config';
+
 import { PrismaService } from '@infrastructure/database/prisma.service';
 
+import {
+  activeStatusForPeriod,
+  buildSubscriptionFields,
+  pickActiveEntitlement,
+} from '@modules/subscriptions/revenuecat.util';
+
 import { KitchenSummaryDto } from './dto/kitchen-summary.dto';
+import {
+  toSellerSubscriptionResponse,
+  type SellerSubscriptionResponseDto,
+} from './dto/seller-subscription-response.dto';
+import { SyncSubscriptionDto } from './dto/sync-subscription.dto';
 import { UpsertSellerBusinessDto } from './dto/upsert-seller-business.dto';
 import { UpsertSellerCuisinesDto } from './dto/upsert-seller-cuisines.dto';
 import { UpsertSellerProfileDto } from './dto/upsert-seller-profile.dto';
 
+import type { ConfigType } from '@nestjs/config';
 import type {
   CuisineType,
   DayOfWeek,
@@ -25,16 +42,133 @@ import type {
 } from '@prisma/client';
 
 /**
- * Fixed platform delivery fee (€2.50 TTC) applied to all seller categories
- * per the client spec. Sellers don't set this during onboarding (yet), so we
- * default it here whenever the profile is upserted without a value — this is
- * what lets orders pass the `deliveryFeeCents !== null` gate in OrdersService.
+ * Default platform delivery fee stored on the seller profile when none is
+ * supplied. Sourced from the shared pricing constant (5,00 €) so it never
+ * diverges from the fee OrdersService actually charges. Order pricing uses the
+ * flat [DELIVERY_FEE_CENTS] directly; this just keeps the profile column in
+ * sync and non-null so the seller can immediately receive orders.
  */
-const DEFAULT_DELIVERY_FEE_CENTS = 250;
+const DEFAULT_DELIVERY_FEE_CENTS = DELIVERY_FEE_CENTS;
 
 @Injectable()
 export class SellersService {
-  constructor(private readonly prisma: PrismaService) {}
+  private readonly logger = new Logger(SellersService.name);
+
+  constructor(
+    private readonly prisma: PrismaService,
+    @Inject(revenueCatConfig.KEY)
+    private readonly rcConfig: ConfigType<typeof revenueCatConfig>,
+  ) {}
+
+  // -------------------- RevenueCat subscription --------------------
+
+  /**
+   * Reconciles the seller's RevenueCat subscription after a purchase/restore.
+   * When a secret REST key is configured we VERIFY the subscriber against
+   * RevenueCat rather than trusting the client; otherwise we apply the client
+   * hint optimistically (the webhook reconciles authoritatively either way).
+   *
+   * Writes the shared gate fields (`subscriptionStatus` /
+   * `subscriptionCurrentPeriodEnd` / `isPremium`) so existing listing/commission
+   * logic honours RevenueCat with no further changes.
+   */
+  async syncRevenueCatSubscription(
+    supabaseId: string,
+    dto: SyncSubscriptionDto,
+  ): Promise<SellerSubscriptionResponseDto> {
+    const userId = await this.assertSeller(supabaseId);
+
+    const verified = await this.verifyWithRevenueCat(userId);
+
+    // Prefer the REST-verified entitlement, but fall back to the client hint
+    // field-by-field when verification found none. Right after a purchase the
+    // entitlement can lag in RevenueCat's REST API (sandbox especially), so a
+    // verified `{ entitlement: null }` must NOT override a just-bought seller's
+    // hint — otherwise they'd be locked out and re-prompted to pay. The webhook
+    // reconciles the authoritative state regardless.
+    const entitlement = verified?.entitlement ?? dto.entitlementId ?? null;
+    const productId = verified?.productId ?? dto.productId ?? null;
+    const expiresAtMs = verified?.expiresAtMs ?? dto.expiresAtMs ?? null;
+    const isTrial = verified?.isTrial ?? dto.isTrial ?? false;
+
+    const status = entitlement
+      ? activeStatusForPeriod(isTrial ? 'TRIAL' : 'NORMAL')
+      : SubscriptionStatus.NONE;
+
+    const updated = await this.prisma.db.sellerProfile.update({
+      where: { userId },
+      // buildSubscriptionFields applies the +1-month fallback so a successful
+      // activation never persists a null expiry (test mode / no expiry).
+      data: buildSubscriptionFields({
+        status,
+        entitlement,
+        productId,
+        expiresAtMs,
+        isTrial,
+        category: dto.category ?? null,
+        revenueCatCustomerId: dto.revenueCatCustomerId ?? userId,
+      }),
+    });
+    this.logger.log(
+      `[SubscriptionSync] status=${updated.subscriptionStatus} ` +
+        `plan=${updated.subscriptionPlan ?? 'none'} ` +
+        `expiresAt=${updated.subscriptionCurrentPeriodEnd?.toISOString() ?? 'null'}`,
+    );
+    return toSellerSubscriptionResponse(updated);
+  }
+
+  /**
+   * Server-side verification via RevenueCat's REST API. Returns the active
+   * seller entitlement (premium wins) or null if none. Returns null (caller
+   * falls back to the client hint) when no secret key is configured or the
+   * call fails — the webhook remains the source of truth. Never throws.
+   */
+  private async verifyWithRevenueCat(appUserId: string): Promise<{
+    entitlement: string | null;
+    productId: string | null;
+    expiresAtMs: number | null;
+    isTrial: boolean;
+  } | null> {
+    const key = this.rcConfig.secretApiKey;
+    if (!key) return null;
+    try {
+      const res = await fetch(
+        `https://api.revenuecat.com/v1/subscribers/${encodeURIComponent(appUserId)}`,
+        { headers: { Authorization: `Bearer ${key}` } },
+      );
+      if (!res.ok) {
+        this.logger.warn(`RevenueCat verify failed: HTTP ${res.status}`);
+        return null;
+      }
+      const body = (await res.json()) as {
+        subscriber?: {
+          entitlements?: Record<
+            string,
+            { expires_date?: string | null; product_identifier?: string }
+          >;
+          subscriptions?: Record<string, { period_type?: string; expires_date?: string | null }>;
+        };
+      };
+      const entitlements = body.subscriber?.entitlements ?? {};
+      const nowMs = Date.now();
+      const activeIds = Object.entries(entitlements)
+        .filter(([, e]) => !e.expires_date || new Date(e.expires_date).getTime() > nowMs)
+        .map(([id]) => id);
+      const entitlement = pickActiveEntitlement(activeIds);
+      if (!entitlement) {
+        return { entitlement: null, productId: null, expiresAtMs: null, isTrial: false };
+      }
+      const ent = entitlements[entitlement];
+      const productId = ent?.product_identifier ?? null;
+      const expiresAtMs = ent?.expires_date ? new Date(ent.expires_date).getTime() : null;
+      const sub = productId ? body.subscriber?.subscriptions?.[productId] : undefined;
+      const isTrial = (sub?.period_type ?? '').toLowerCase() === 'trial';
+      return { entitlement, productId, expiresAtMs, isTrial };
+    } catch (err) {
+      this.logger.warn(`RevenueCat verify error: ${(err as Error).message}`);
+      return null;
+    }
+  }
 
   // -------------------- Buyer-facing feed --------------------
 

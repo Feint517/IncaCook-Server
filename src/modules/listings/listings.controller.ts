@@ -134,6 +134,7 @@ export function toFeedListing(row: FeedRow): FeedListingResponseDto {
     updatedAt: row.updatedAt,
     extras: [],
     sellerName: row.sellerName,
+    sellerAvatarUrl: row.sellerAvatarUrl,
     distanceKm,
     inRange,
     rating: row.rating,

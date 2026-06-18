@@ -104,6 +104,7 @@ function toFeedListing(row: FeedRow): FeedListingResponseDto {
     updatedAt: row.updatedAt,
     extras: [],
     sellerName: row.sellerName,
+    sellerAvatarUrl: row.sellerAvatarUrl,
     distanceKm: null,
     inRange: null,
     rating: row.rating,

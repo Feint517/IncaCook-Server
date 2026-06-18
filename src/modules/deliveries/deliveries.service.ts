@@ -1,22 +1,26 @@
 import {
   ConflictException,
   ForbiddenException,
+  HttpStatus,
   Injectable,
   Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { DeliveryStatus } from '@prisma/client';
 
+import { ErrorCodes } from '@common/constants/error-codes.constants';
 import { IssueSeverity } from '@common/enums/issue-severity.enum';
 import { KycStatus } from '@common/enums/kyc-status.enum';
 import { OrderStatus } from '@common/enums/order-status.enum';
 import { UserRole } from '@common/enums/user-role.enum';
+import { DomainException } from '@common/exceptions/domain.exception';
 import { generateUlid } from '@common/utils/code-generator.util';
 
 import { AuditService } from '@infrastructure/audit/audit.service';
 import { PrismaService } from '@infrastructure/database/prisma.service';
 import { RedisService } from '@infrastructure/redis/redis.service';
 
+import { ConversationsService } from '@modules/messaging/conversations.service';
 import { NotificationsService } from '@modules/notifications/notifications.service';
 import { OrdersService } from '@modules/orders/orders.service';
 import { driverLocChannel } from '@modules/tracking/tracking.gateway';
@@ -72,6 +76,7 @@ export class DeliveriesService {
     private readonly audit: AuditService,
     private readonly redis: RedisService,
     private readonly notifications: NotificationsService,
+    private readonly conversations: ConversationsService,
   ) {}
 
   // -----------------------------------------------------------------------
@@ -382,6 +387,16 @@ export class DeliveriesService {
     const driver = await this.assertDriver(supabaseId);
     const isDev = process.env.NODE_ENV === 'development';
 
+    // Safe diagnostics for the payout/KYC gate (no secrets — id presence only).
+    const kycApproved = driver.kycStatus === KycStatus.Approved;
+    const canClaim = isDev || (kycApproved && driver.stripeOnboardingCompleted);
+    this.logger.log(`[DriverClaim] kycStatus=${driver.kycStatus}`);
+    this.logger.log(
+      `[DriverClaim] stripeConnectAccountId=${driver.stripeConnectAccountId ? 'present' : 'missing'}`,
+    );
+    this.logger.log(`[DriverClaim] stripeOnboardingCompleted=${driver.stripeOnboardingCompleted}`);
+    this.logger.log(`[DriverClaim] canClaim=${canClaim}`);
+
     if (driver.kycStatus !== KycStatus.Approved) {
       if (isDev) {
         await this.prisma.db.driverProfile.update({
@@ -395,14 +410,24 @@ export class DeliveriesService {
     }
     if (!driver.stripeOnboardingCompleted) {
       if (isDev) {
+        // Local-dev convenience ONLY: skip real payout setup so claims work
+        // without a Stripe Connect account. A developer can also set this by
+        // hand: `UPDATE "DriverProfile" SET "stripeOnboardingCompleted" = true
+        // WHERE "userId" = '<id>';`. REAL payout tests still need a real
+        // Stripe Connect account id (stripeConnectAccountId) — this flag alone
+        // does NOT make transfers succeed.
         await this.prisma.db.driverProfile.update({
           where: { userId: driver.userId },
           data: { stripeOnboardingCompleted: true },
         });
         this.logger.debug(`[dev] auto-completed Stripe Connect for ${driver.userId}`);
       } else {
-        throw new ForbiddenException(
+        // Typed code so the app can map this to a clear "set up payments" CTA
+        // instead of showing the raw backend message. Status stays 403.
+        throw new DomainException(
+          ErrorCodes.PayoutOnboardingIncomplete,
           'Complete Stripe Connect onboarding before claiming deliveries',
+          HttpStatus.FORBIDDEN,
         );
       }
     }
@@ -431,6 +456,13 @@ export class DeliveriesService {
       deliveryId,
       'delivery_assigned',
       { buyer: true },
+    );
+    // Open the seller ↔ driver chat so they can coordinate pickup. Idempotent
+    // and never throws — must not block the claim.
+    await this.conversations.ensureSellerDriverConversation(
+      delivery.orderId,
+      driver.userId,
+      deliveryId,
     );
     return delivery;
   }
@@ -594,6 +626,7 @@ export class DeliveriesService {
     userId: string;
     kycStatus: KycStatus;
     stripeOnboardingCompleted: boolean;
+    stripeConnectAccountId: string | null;
   }> {
     const user = await this.prisma.db.user.findUnique({
       where: { supabaseId },
@@ -609,6 +642,7 @@ export class DeliveriesService {
       userId: user.driverProfile.userId,
       kycStatus: user.driverProfile.kycStatus as KycStatus,
       stripeOnboardingCompleted: user.driverProfile.stripeOnboardingCompleted,
+      stripeConnectAccountId: user.driverProfile.stripeConnectAccountId,
     };
   }
 

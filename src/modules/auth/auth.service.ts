@@ -11,6 +11,9 @@ import {
 } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 
+import { ErrorCodes } from '@common/constants/error-codes.constants';
+import { DomainException } from '@common/exceptions/domain.exception';
+
 import { PrismaService } from '@infrastructure/database/prisma.service';
 import { PreludeVerifyService } from '@infrastructure/notifications/sms/prelude-verify.service';
 import { SupabaseAdminService } from '@infrastructure/supabase/supabase-admin.service';
@@ -20,6 +23,11 @@ import { PhoneVerifyResponseDto } from './dto/phone-verify-response.dto';
 import { SessionResponseDto } from './dto/session-response.dto';
 
 import type { AuthError, Session, User } from '@supabase/supabase-js';
+
+/** Max time to wait on Supabase signUp before failing fast (incl. its
+ *  server-side confirmation-email send). Well under the app's 30s client
+ *  timeout so the user gets a clean error instead of a hang. */
+const SIGNUP_SUPABASE_TIMEOUT_MS = 12_000;
 
 /**
  * Thin proxy in front of Supabase Auth. The Flutter app only ever talks to
@@ -46,7 +54,32 @@ export class AuthService {
   ) {}
 
   async signUp(email: string, password: string): Promise<SessionResponseDto> {
-    const { data, error } = await this.anon.client.auth.signUp({ email, password });
+    // Timing logs (NEVER the password) so we can see whether a slow signup is
+    // the Supabase call (incl. its confirmation-email send) vs. something else.
+    const startedAt = Date.now();
+    this.logger.log('signup: request received');
+
+    let result: Awaited<ReturnType<typeof this.anon.client.auth.signUp>>;
+    try {
+      this.logger.log('signup: supabase.auth.signUp start');
+      // Bound the call so a slow Supabase SMTP / upstream can't hang the
+      // request for the client's full 30s timeout — fail fast and clean.
+      result = await this.withTimeout(
+        this.anon.client.auth.signUp({ email, password }),
+        SIGNUP_SUPABASE_TIMEOUT_MS,
+        'supabase.auth.signUp',
+      );
+    } catch {
+      this.logger.error(
+        `signup: supabase.auth.signUp did not return in time (${Date.now() - startedAt}ms)`,
+      );
+      throw new ServiceUnavailableException(
+        "L'inscription a expiré côté serveur. Veuillez réessayer.",
+      );
+    }
+    this.logger.log(`signup: supabase.auth.signUp done (${Date.now() - startedAt}ms)`);
+
+    const { data, error } = result;
     if (error) {
       throw this.toHttpException(error, 'signup failed');
     }
@@ -55,7 +88,9 @@ export class AuthService {
       // session here — caller must re-signin once they've confirmed.
       throw new BadRequestException('Account created — confirm your email before signing in');
     }
-    return this.toSession(data.session);
+    const session = this.toSession(data.session);
+    this.logger.log(`signup: response sent (${Date.now() - startedAt}ms)`);
+    return session;
   }
 
   async signIn(email: string, password: string): Promise<SessionResponseDto> {
@@ -182,17 +217,58 @@ export class AuthService {
   }
 
   /**
-   * Sends a 6-digit email verification code to the caller's own email
-   * (resolved from the JWT, never the body) via Supabase's email OTP. Pair
-   * with `verifyEmailOtp`, which flips `User.emailVerified = true`.
+   * Sends a 6-digit email verification code via Supabase's email OTP. Pair
+   * with `verifyEmailOtp`.
+   *
+   * When [attach] is true (the OAuth no-email case) we first set the email on
+   * the auth user via admin so `signInWithOtp` targets THIS account and the
+   * verification binds the address to it. The email stays unconfirmed until
+   * the OTP is verified, so the frontend value is never trusted as verified.
    */
-  async requestEmailOtp(email: string): Promise<void> {
+  async requestEmailOtp(supabaseId: string, email: string, attach: boolean): Promise<void> {
+    // This sends Supabase Auth's email OTP, which is rendered by the
+    // "Magic Link" email template. The user sees a 6-DIGIT CODE only if that
+    // template renders `{{ .Token }}`; if it renders only
+    // `{{ .ConfirmationURL }}` they receive a sign-in LINK instead and the
+    // in-app code screen can't proceed. The email is sent by Supabase's own
+    // SMTP (Dashboard → Authentication → SMTP Settings), NOT by the backend
+    // MAIL_* / nodemailer config — those only drive backend-managed emails.
+    // Safe log: no email address, no token.
+    this.logger.log(
+      'Email OTP requested through Supabase Auth. Make sure Supabase Magic Link template uses {{ .Token }}.',
+    );
+    if (attach) {
+      const { error: updateError } = await this.admin.client.auth.admin.updateUserById(supabaseId, {
+        email,
+      });
+      if (updateError) {
+        throw this.toHttpException(updateError, 'email attach failed');
+      }
+    }
     const { error } = await this.anon.client.auth.signInWithOtp({
       email,
       options: { shouldCreateUser: false },
     });
     if (error) {
       throw this.toHttpException(error, 'email OTP request failed');
+    }
+  }
+
+  /**
+   * Attaches `email` (UNCONFIRMED) to the authenticated user via admin, for the
+   * Flutter "complete email" magic-link flow. We deliberately don't send the
+   * link here: the **client** calls `signInWithOtp(emailRedirectTo: ...)` right
+   * after, so the PKCE code-verifier lives in the app and the
+   * `incacook://auth/callback?flow=complete_email` redirect can be completed
+   * in-app. The email is only ever trusted once the magic link / OTP sets
+   * `email_confirmed_at` (the resolver in UsersService checks that). Never logs
+   * the address.
+   */
+  async attachEmail(supabaseId: string, email: string): Promise<void> {
+    this.logger.log('Email attach (admin) for the complete-email magic-link flow.');
+    const { error } = await this.admin.client.auth.admin.updateUserById(supabaseId, { email });
+    if (error) {
+      throw this.toHttpException(error, 'email attach failed');
     }
   }
 
@@ -206,6 +282,11 @@ export class AuthService {
     email: string,
     code: string,
   ): Promise<SessionResponseDto> {
+    // Confirms the 6-digit code dispatched by `requestEmailOtp`'s
+    // `signInWithOtp`. `type: 'email'` matches that flow. The code is only
+    // human-visible if the Supabase Magic Link template uses `{{ .Token }}`
+    // (see `requestEmailOtp`); a `{{ .ConfirmationURL }}` template sends a
+    // link, so the user would never have a code to enter here.
     const { data, error } = await this.anon.client.auth.verifyOtp({
       email,
       token: code,
@@ -244,7 +325,17 @@ export class AuthService {
    * phone already attached to another user. [supabaseId] comes from the JWT.
    */
   async requestPhoneOtp(supabaseId: string, phone: string): Promise<void> {
-    await this.assertPhoneAvailable(supabaseId, phone);
+    // Gate FIRST so a phone owned by another account never triggers an SMS:
+    // [assertPhoneAvailable] throws PhoneAlreadyUsed (409) and Prelude is not
+    // called. This is the same guard the verify path uses (unified handling).
+    try {
+      await this.assertPhoneAvailable(supabaseId, phone);
+    } catch (err) {
+      if (err instanceof DomainException && err.code === ErrorCodes.PhoneAlreadyUsed) {
+        this.logger.warn(`[PhoneOtp] request failed code=${err.code}`);
+      }
+      throw err;
+    }
     const { status } = await this.prelude.sendPhoneOtp(phone);
     // Prelude statuses: 'success'/'retry' = OTP dispatched; anything else
     // ('blocked', 'shadow_blocked', 'unknown', …) means no SMS was sent — fail
@@ -303,25 +394,52 @@ export class AuthService {
       });
     } catch (err) {
       if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
-        throw new ConflictException('Ce numéro de téléphone est déjà utilisé.');
+        throw new DomainException(
+          ErrorCodes.PhoneAlreadyUsed,
+          'Ce numéro de téléphone est déjà utilisé.',
+          HttpStatus.CONFLICT,
+        );
       }
       throw err;
     }
     return { phoneVerified: true, phone };
   }
 
-  /** Rejects a phone already attached to a different user (phone is @unique). */
+  /**
+   * Rejects a phone already attached to a different user (phone is @unique).
+   * Throws a typed [DomainException] so the response carries the machine
+   * code `INCACOOK_PHONE_ALREADY_USED` (409) — the Flutter app keys off it to
+   * keep the red error and suppress the "code sent" success message.
+   */
   private async assertPhoneAvailable(supabaseId: string, phone: string): Promise<void> {
     const taken = await this.prisma.db.user.findFirst({
       where: { phone, NOT: { supabaseId } },
       select: { id: true },
     });
     if (taken) {
-      throw new ConflictException('Ce numéro de téléphone est déjà utilisé.');
+      throw new DomainException(
+        ErrorCodes.PhoneAlreadyUsed,
+        'Ce numéro de téléphone est déjà utilisé.',
+        HttpStatus.CONFLICT,
+      );
     }
   }
 
   // -------------------- internals --------------------
+
+  /** Rejects if `promise` doesn't settle within `ms`. Clears the timer either
+   *  way so we don't leak a pending handle. */
+  private async withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    });
+    try {
+      return await Promise.race([promise, timeout]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
 
   private toSession(session: Session): SessionResponseDto {
     const user = session.user as User;

@@ -29,6 +29,11 @@ export class ListingExtraResponseDto {
 export class ListingResponseDto {
   id!: string;
   sellerId!: string;
+  // Seller identity, joined from SellerProfile. Null on responses that don't
+  // load the seller relation (e.g. the create/update echo). The buyer's
+  // product-detail screen binds its seller block to these.
+  sellerName!: string | null;
+  sellerAvatarUrl!: string | null;
   name!: string;
   description!: string | null;
   imageUrls!: string[];
@@ -62,10 +67,19 @@ export class ListingResponseDto {
 
   extras!: ListingExtraResponseDto[];
 
-  static from(listing: Listing & { addOns: ListingAddOn[] }): ListingResponseDto {
+  static from(
+    listing: Listing & {
+      addOns: ListingAddOn[];
+      // Optional: only loaded by the detail read (`findById`). When absent the
+      // seller fields ship as null rather than fabricated/mock values.
+      seller?: { displayName: string | null; profilePhotoUrl: string | null } | null;
+    },
+  ): ListingResponseDto {
     return {
       id: listing.id,
       sellerId: listing.sellerId,
+      sellerName: listing.seller?.displayName ?? null,
+      sellerAvatarUrl: listing.seller?.profilePhotoUrl ?? null,
       name: listing.name,
       description: listing.description,
       imageUrls: listing.imageUrls,

@@ -1,10 +1,14 @@
 import {
   ForbiddenException,
+  HttpException,
   Inject,
   Injectable,
   InternalServerErrorException,
+  Logger,
   NotFoundException,
+  ServiceUnavailableException,
 } from '@nestjs/common';
+import Stripe from 'stripe';
 
 import { UserRole } from '@common/enums/user-role.enum';
 
@@ -33,6 +37,8 @@ function isNoSuchAccountError(err: unknown): boolean {
 
 @Injectable()
 export class OnboardingService {
+  private readonly logger = new Logger(OnboardingService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly stripe: StripeService,
@@ -69,31 +75,67 @@ export class OnboardingService {
       throw new NotFoundException('Complete your profile before starting Stripe onboarding');
     }
 
-    let accountId = profile.stripeConnectAccountId ?? (await this.createExpressAccount(user));
-
     try {
-      const link = await this.stripe.client.accountLinks.create({
-        account: accountId,
-        type: 'account_onboarding',
-        return_url: this.cfg.onboardingReturnUrl,
-        refresh_url: this.cfg.onboardingRefreshUrl,
-      });
-      return { url: link.url, expiresAt: link.expires_at };
+      let accountId = profile.stripeConnectAccountId ?? (await this.createExpressAccount(user));
+      try {
+        return await this.mintAccountLink(accountId);
+      } catch (err) {
+        // The stored Connect account id no longer exists on this Stripe
+        // account — e.g. a seed placeholder (`acct_test_seed_seller`) or the
+        // platform key was rotated to a different account. Recreate once
+        // against a fresh Express account instead of failing the user.
+        if (!isNoSuchAccountError(err)) throw err;
+        accountId = await this.createExpressAccount(user);
+        return await this.mintAccountLink(accountId);
+      }
     } catch (err) {
-      // The stored Connect account id no longer exists on this Stripe
-      // account — e.g. a seed placeholder (`acct_test_seed_seller`) or the
-      // platform key was rotated to a different account. Recreate once
-      // against a fresh Express account instead of failing the seller.
-      if (!isNoSuchAccountError(err)) throw err;
-      accountId = await this.createExpressAccount(user);
-      const link = await this.stripe.client.accountLinks.create({
-        account: accountId,
-        type: 'account_onboarding',
-        return_url: this.cfg.onboardingReturnUrl,
-        refresh_url: this.cfg.onboardingRefreshUrl,
-      });
-      return { url: link.url, expiresAt: link.expires_at };
+      // Map any Stripe API failure to a clean, logged error so the app shows a
+      // helpful message instead of a bare 500 (INCACOOK_UNKNOWN).
+      this.rethrowMapped(err);
     }
+  }
+
+  /** Mints an account-onboarding link for an existing Connect account. */
+  private async mintAccountLink(accountId: string): Promise<AccountLinkResponseDto> {
+    const link = await this.stripe.client.accountLinks.create({
+      account: accountId,
+      type: 'account_onboarding',
+      return_url: this.cfg.onboardingReturnUrl,
+      refresh_url: this.cfg.onboardingRefreshUrl,
+    });
+    return { url: link.url, expiresAt: link.expires_at };
+  }
+
+  /**
+   * Turns a thrown error into a clear HTTP response. Stripe API errors (e.g.
+   * "you haven't signed up for Connect", invalid country) are an upstream /
+   * platform-config problem, not a server bug — surface them as 503 with a
+   * user-safe message and log the real Stripe reason for the operator. Our own
+   * HttpExceptions (NotFound / Forbidden) pass through untouched.
+   */
+  private rethrowMapped(err: unknown): never {
+    if (err instanceof HttpException) throw err;
+
+    if (err instanceof Stripe.errors.StripeError) {
+      this.logger.error(
+        `[StripeOnboarding] ${err.type} (status=${err.statusCode ?? '-'}): ${err.message}`,
+      );
+      // Connect not enabled on the platform account — the operator must turn
+      // it on in the Stripe dashboard (https://dashboard.stripe.com/connect).
+      if (/signed up for Connect|enable .*Connect|Connect settings/i.test(err.message)) {
+        throw new ServiceUnavailableException(
+          "La configuration des paiements n'est pas encore activée sur la plateforme. Réessayez plus tard.",
+        );
+      }
+      throw new ServiceUnavailableException(
+        'Configuration des paiements indisponible pour le moment. Réessayez plus tard.',
+      );
+    }
+
+    this.logger.error(`[StripeOnboarding] unexpected error: ${String(err)}`);
+    throw new ServiceUnavailableException(
+      'Configuration des paiements indisponible pour le moment. Réessayez plus tard.',
+    );
   }
 
   /**

@@ -9,6 +9,7 @@ import {
 } from '@nestjs/common';
 import { AddressKind, Prisma } from '@prisma/client';
 
+import { priceOrder, type OrderTotals } from '@common/constants/pricing.constants';
 import { DeliveryTiming } from '@common/enums/delivery-timing.enum';
 import { FulfillmentChoice } from '@common/enums/fulfillment-choice.enum';
 import { KycStatus } from '@common/enums/kyc-status.enum';
@@ -40,13 +41,6 @@ type OrderWithEverything = Order & {
 };
 
 type Tx = Prisma.TransactionClient;
-
-/** Premium sellers pay 25%, everyone else 30%. Mirrors the env defaults. */
-const COMMISSION_RATE_BPS_STANDARD = 3000;
-const COMMISSION_RATE_BPS_PREMIUM = 2500;
-// Commission floor: 1 € (100 cents) per the client spec — commission is
-// never less than this regardless of subtotal × rate.
-const COMMISSION_MIN_CENTS = 100;
 
 @Injectable()
 export class OrdersService {
@@ -959,16 +953,9 @@ export class OrdersService {
     items: CreateOrderItemDto[],
     listings: Array<{ id: string; priceCents: number }>,
     addOns: Map<string, { priceDeltaCents: number }>,
-    seller: { isPremium: boolean; deliveryFeeCents: number },
+    seller: { isPremium: boolean },
     choice: FulfillmentChoice,
-  ): {
-    subtotalCents: number;
-    fulfillmentFeeCents: number;
-    commissionRateBps: number;
-    commissionCents: number;
-    sellerEarningsCents: number;
-    buyerTotalCents: number;
-  } {
+  ): OrderTotals {
     const listingPriceById = new Map(listings.map((l) => [l.id, l.priceCents]));
 
     let subtotalCents = 0;
@@ -981,35 +968,13 @@ export class OrdersService {
       subtotalCents += (price + addonsCents) * item.quantity;
     }
 
-    const fulfillmentFeeCents = choice === FulfillmentChoice.Delivery ? seller.deliveryFeeCents : 0;
-
-    const commissionRateBps = seller.isPremium
-      ? COMMISSION_RATE_BPS_PREMIUM
-      : COMMISSION_RATE_BPS_STANDARD;
-    // Commission = rate × subtotal, rounded, with a 1 € (100 cents) MINIMUM
-    // per the client spec: commission = max(round(subtotal·rate), 100).
-    const commissionCents = Math.max(
-      Math.round((subtotalCents * commissionRateBps) / 10_000),
-      COMMISSION_MIN_CENTS,
-    );
-    const sellerEarningsCents = subtotalCents - commissionCents;
-    const buyerTotalCents = subtotalCents + fulfillmentFeeCents;
-
-    // Sanity: the platform's eventual cut at transfer time is
-    // commissionCents + fulfillmentFeeCents. That sum + sellerEarningsCents
-    // must equal buyerTotalCents.
-    if (commissionCents + sellerEarningsCents + fulfillmentFeeCents !== buyerTotalCents) {
-      throw new Error('Money math mismatch in order totals computation');
-    }
-
-    return {
-      subtotalCents,
-      fulfillmentFeeCents,
-      commissionRateBps,
-      commissionCents,
-      sellerEarningsCents,
-      buyerTotalCents,
-    };
+    // Delegate the fee/commission/total math to the shared pricing function —
+    // flat 5,00 € delivery + 5% platform buyer fee live there (single source
+    // of truth). The buyer total it returns is the Stripe PaymentIntent amount.
+    return priceOrder(subtotalCents, {
+      isPremium: seller.isPremium,
+      isDelivery: choice === FulfillmentChoice.Delivery,
+    });
   }
 
   private async ensureStripeCustomer(

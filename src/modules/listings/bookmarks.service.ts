@@ -84,6 +84,7 @@ export class BookmarksService {
         l."createdAt",
         l."updatedAt",
         sp."displayName" AS "sellerName",
+        sp."profilePhotoUrl" AS "sellerAvatarUrl",
         sp."deliveryRadiusKm"::float8 AS "sellerRadiusKm",
         sp."averageRating" AS "rating",
         sp."reviewCount" AS "reviewCount",

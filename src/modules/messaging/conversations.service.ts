@@ -2,6 +2,7 @@ import {
   BadRequestException,
   ForbiddenException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { ConversationType, ParticipantRole } from '@prisma/client';
@@ -38,6 +39,8 @@ export interface ConversationListItem {
  */
 @Injectable()
 export class ConversationsService {
+  private readonly logger = new Logger(ConversationsService.name);
+
   constructor(private readonly prisma: PrismaService) {}
 
   /**
@@ -66,6 +69,11 @@ export class ConversationsService {
     if (type === ConversationType.BUYER_DELIVERY) {
       // Delivery thread is buyer ↔ driver. Identify by DriverProfile.
       return profile?.driverProfile != null ? ParticipantRole.DELIVERY : ParticipantRole.BUYER;
+    }
+    if (type === ConversationType.SELLER_DRIVER) {
+      // Seller ↔ driver thread: the driver has a DriverProfile, the other
+      // party is the seller.
+      return profile?.driverProfile != null ? ParticipantRole.DELIVERY : ParticipantRole.SELLER;
     }
     // BUYER_SELLER: the one with a SellerProfile is the seller.
     return profile?.sellerProfile != null ? ParticipantRole.SELLER : ParticipantRole.BUYER;
@@ -127,6 +135,18 @@ export class ConversationsService {
       );
     }
 
+    if (type === ConversationType.SELLER_DRIVER) {
+      // Seller ↔ assigned driver. The buyer is never a party here.
+      if (isSeller) {
+        if (!driverId) {
+          throw new BadRequestException('No driver has been assigned to this order yet');
+        }
+        return driverId;
+      }
+      if (isDriver) return order.sellerId;
+      throw new BadRequestException('Only the seller or the assigned driver can open this chat');
+    }
+
     // BUYER_SELLER
     if (isBuyer) return order.sellerId;
     if (isSeller) return order.buyerId;
@@ -152,8 +172,13 @@ export class ConversationsService {
     // BUYER_DELIVERY (buyer ↔ driver) can be opened either order-scoped
     // (orderId — the peer is derived from the order's assigned driver) or
     // directly by peerUserId. Require at least one so the peer is resolvable.
-    if (dto.type === ConversationType.BUYER_DELIVERY && !dto.orderId && !dto.peerUserId) {
-      throw new BadRequestException('BUYER_DELIVERY requires an orderId or peerUserId');
+    if (
+      (dto.type === ConversationType.BUYER_DELIVERY ||
+        dto.type === ConversationType.SELLER_DRIVER) &&
+      !dto.orderId &&
+      !dto.peerUserId
+    ) {
+      throw new BadRequestException(`${dto.type} requires an orderId or peerUserId`);
     }
 
     // Resolve the counterpart. The caller may name it explicitly
@@ -226,6 +251,74 @@ export class ConversationsService {
     });
 
     return { id: conversationId, type: dto.type };
+  }
+
+  /**
+   * Creates (or reuses) the seller ↔ driver conversation for an order. Called
+   * automatically when a driver claims the delivery, so the two coordinate
+   * pickup. Idempotent: re-claiming / re-calling returns the existing thread
+   * (deduped on type + orderId + both participants). System-initiated, so it
+   * takes ids directly rather than a JWT. Never throws — chat must never block
+   * the claim. Returns whether a new conversation was created.
+   */
+  async ensureSellerDriverConversation(
+    orderId: string,
+    driverId: string,
+    deliveryId?: string,
+  ): Promise<{ id: string | null; created: boolean }> {
+    try {
+      const order = await this.prisma.db.order.findUnique({
+        where: { id: orderId },
+        select: { sellerId: true },
+      });
+      if (!order || order.sellerId === driverId) {
+        return { id: null, created: false };
+      }
+      const sellerId = order.sellerId;
+
+      const existing = await this.prisma.db.conversation.findFirst({
+        where: {
+          type: ConversationType.SELLER_DRIVER,
+          orderId,
+          AND: [
+            { participants: { some: { userId: sellerId } } },
+            { participants: { some: { userId: driverId } } },
+          ],
+        },
+        select: { id: true },
+      });
+      if (existing) {
+        this.logger.log(`[SellerDriverChat] existing conversation=${existing.id} order=${orderId}`);
+        return { id: existing.id, created: false };
+      }
+
+      const conversationId = generateUlid();
+      this.logger.log(
+        `[SellerDriverChat] creating conversation order=${orderId} delivery=${deliveryId ?? '-'}`,
+      );
+      await this.prisma.$transaction(async (tx) => {
+        await tx.conversation.create({
+          data: { id: conversationId, type: ConversationType.SELLER_DRIVER, orderId },
+        });
+        await tx.conversationParticipant.createMany({
+          data: [
+            { id: generateUlid(), conversationId, userId: sellerId, role: ParticipantRole.SELLER },
+            {
+              id: generateUlid(),
+              conversationId,
+              userId: driverId,
+              role: ParticipantRole.DELIVERY,
+            },
+          ],
+        });
+      });
+      return { id: conversationId, created: true };
+    } catch (err) {
+      this.logger.warn(
+        `[SellerDriverChat] ensure failed for order=${orderId}: ${(err as Error).message}`,
+      );
+      return { id: null, created: false };
+    }
   }
 
   /**

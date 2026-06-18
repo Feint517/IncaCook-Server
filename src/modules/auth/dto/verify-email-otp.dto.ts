@@ -1,15 +1,23 @@
-import { IsString, Matches } from 'class-validator';
+import { Transform } from 'class-transformer';
+import { IsEmail, IsOptional, IsString, Length } from 'class-validator';
 
 /**
  * Body for `POST /v1/auth/email/verify`. Confirms the 6-digit code sent to
  * the caller's email by `/v1/auth/email/request-otp`; on success we flip
  * `User.emailVerified = true`.
+ *
+ * `email` is OPTIONAL and only used for the add-email flow (OAuth identity
+ * with no email) — must match the address `request-otp` sent the code to.
+ * Ignored when the JWT already carries an email.
  */
+
 export class VerifyEmailOtpDto {
   @IsString()
-  // Supabase's OTP length is a per-project setting (currently 6-10 digits;
-  // 6 on local CLI, 8 by default on cloud). Match the same range as the
-  // phone OTP DTO so future config changes don't require a redeploy.
-  @Matches(/^\d{6,10}$/, { message: 'code must be 6-10 digits' })
+  @Length(6, 6)
   code!: string;
+
+  @IsOptional()
+  @Transform(({ value }) => (typeof value === 'string' ? value.trim().toLowerCase() : value))
+  @IsEmail()
+  email?: string;
 }

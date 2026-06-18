@@ -53,3 +53,11 @@ prisma/.env
 
 # Local test accounts (gitignored — contains plaintext passwords)
 test-accounts.local.md
+
+# Local secrets / backups
+.env
+.env.*
+*.env
+*.bak
+.env.bak*
+codes

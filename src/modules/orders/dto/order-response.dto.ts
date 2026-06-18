@@ -59,6 +59,11 @@ export class OrderResponseDto {
   // Pricing snapshot.
   subtotalCents!: number;
   fulfillmentFeeCents!: number;
+  /** Alias of [fulfillmentFeeCents] — the 5,00 € delivery fee (0 for pickup). */
+  deliveryFeeCents!: number;
+  /** 5% platform fee charged to the buyer on (subtotal + delivery). Derived
+   *  from the persisted total so it always reconciles with what was charged. */
+  platformBuyerFeeCents!: number;
   commissionCents!: number;
   sellerEarningsCents!: number;
   buyerTotalCents!: number;
@@ -99,6 +104,11 @@ export class OrderResponseDto {
       sellerId: order.sellerId,
       subtotalCents: order.subtotalCents,
       fulfillmentFeeCents: order.fulfillmentFeeCents,
+      deliveryFeeCents: order.fulfillmentFeeCents,
+      // buyerTotal = subtotal + delivery + platformFee → platformFee is the
+      // remainder. Exact (same integer math used at creation).
+      platformBuyerFeeCents:
+        order.buyerTotalCents - order.subtotalCents - order.fulfillmentFeeCents,
       commissionCents: order.commissionCents,
       sellerEarningsCents: order.sellerEarningsCents,
       buyerTotalCents: order.buyerTotalCents,

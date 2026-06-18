@@ -154,7 +154,7 @@ export class UsersController {
   }
 }
 
-function toUserResponse(aggregate: UserAggregate): UserResponseDto {
+export function toUserResponse(aggregate: UserAggregate): UserResponseDto {
   const buyerProfile = aggregate.buyerProfile
     ? BuyerProfileResponseDto.from(
         aggregate.buyerProfile,

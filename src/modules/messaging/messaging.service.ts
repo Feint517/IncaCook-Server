@@ -1,10 +1,12 @@
 import { ForbiddenException, Injectable, Logger, NotFoundException } from '@nestjs/common';
-import { MessageType, ParticipantRole, Prisma } from '@prisma/client';
+import { ConversationType, MessageType, ParticipantRole, Prisma } from '@prisma/client';
 
 import { generateUlid } from '@common/utils/code-generator.util';
 
 import { PrismaService } from '@infrastructure/database/prisma.service';
 import { RedisService } from '@infrastructure/redis/redis.service';
+
+import { NotificationsService } from '@modules/notifications/notifications.service';
 
 import { ConversationsService } from './conversations.service';
 import { ListMessagesQueryDto } from './dto/list-messages.query.dto';
@@ -34,6 +36,7 @@ export class MessagingService {
     private readonly prisma: PrismaService,
     private readonly redis: RedisService,
     private readonly conversations: ConversationsService,
+    private readonly notifications: NotificationsService,
   ) {}
 
   async send(
@@ -50,7 +53,10 @@ export class MessagingService {
       throw new ForbiddenException('Message too long (max 4000 chars)');
     }
 
-    const { callerUserId } = await this.conversations.assertParticipant(supabaseId, conversationId);
+    const { callerUserId, conversation } = await this.conversations.assertParticipant(
+      supabaseId,
+      conversationId,
+    );
     // Fetch the caller's role on this conversation for the broadcast
     // payload (used by clients to align bubbles correctly).
     const me = await this.prisma.db.conversationParticipant.findUnique({
@@ -59,6 +65,11 @@ export class MessagingService {
     });
     if (!me) {
       throw new NotFoundException('Participant row missing');
+    }
+
+    if (conversation.type === ConversationType.SELLER_DRIVER) {
+      const from = me.role === ParticipantRole.DELIVERY ? 'DRIVER' : 'SELLER';
+      this.logger.log(`[SellerDriverChat] message sent from=${from}`);
     }
 
     const messageId = generateUlid();
@@ -109,7 +120,35 @@ export class MessagingService {
       createdAt: now,
     };
     await this.publish(conversationId, payload);
+    await this.notifyPeers(conversationId, callerUserId, trimmed);
     return payload;
+  }
+
+  /**
+   * Best-effort push to the OTHER participant(s) that a new message arrived.
+   * Never throws — a notification failure must not fail the send (the realtime
+   * socket already delivered it to anyone with the chat open).
+   */
+  private async notifyPeers(
+    conversationId: string,
+    senderUserId: string,
+    preview: string,
+  ): Promise<void> {
+    try {
+      const others = await this.prisma.db.conversationParticipant.findMany({
+        where: { conversationId, userId: { not: senderUserId } },
+        select: { userId: true },
+      });
+      const recipientIds = others.map((p) => p.userId);
+      if (recipientIds.length === 0) return;
+      await this.notifications.sendToUsers(recipientIds, {
+        title: 'Nouveau message',
+        body: preview.length > 120 ? `${preview.slice(0, 117)}…` : preview,
+        data: { type: 'chat_message', conversationId },
+      });
+    } catch (err) {
+      this.logger.warn(`message notify failed for ${conversationId}: ${(err as Error).message}`);
+    }
   }
 
   /**
