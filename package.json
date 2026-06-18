@@ -4,7 +4,7 @@
   "description": "IncaCook backend API — anti-food-waste local food marketplace",
   "private": true,
   "scripts": {
-    "build": "nest build",
+    "build": "prisma generate && nest build"
     "start": "nest start",
     "start:services": "docker compose up -d && npx supabase start",
     "stop:services": "docker compose down && npx supabase stop",
