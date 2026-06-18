@@ -8,12 +8,14 @@ on:
 env:
   NODE_VERSION: '22'
   PNPM_VERSION: '9.15.0'
+  DATABASE_URL: postgresql://postgres:postgres@localhost:5432/incacook_ci
 
 jobs:
   deploy:
     name: Build & deploy
     runs-on: ubuntu-latest
     environment: production
+
     steps:
       - uses: actions/checkout@v4
 
@@ -26,7 +28,11 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           cache: pnpm
 
-      - run: pnpm install --frozen-lockfile
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma Client
+        run: pnpm prisma generate
 
       - name: Build
         run: pnpm build
