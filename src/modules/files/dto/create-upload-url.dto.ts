@@ -10,6 +10,7 @@ export enum UploadPurpose {
   KycDocument = 'kyc_document',
   ListingImage = 'listing_image',
   SellerFacade = 'seller_facade',
+  DeliveryProof = 'delivery_proof',
 }
 
 /**

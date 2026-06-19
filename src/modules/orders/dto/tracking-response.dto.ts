@@ -34,6 +34,8 @@ export class TrackingDriverDto {
 export class OrderTrackingResponseDto {
   /** Backend `OrderStatus` enum string (PENDING … DELIVERED …). */
   orderStatus!: string;
+  /** Reason an order was cancelled (e.g. `seller_unavailable`), or null. */
+  cancellationReason!: string | null;
   /** `DELIVERY` | `PICKUP` — lets the client show the pickup handoff UI. */
   fulfillmentChoice!: string;
   /** Backend `DeliveryStatus` enum string, or null when no delivery row. */

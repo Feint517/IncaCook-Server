@@ -7,6 +7,7 @@ import {
   NotFoundException,
   ServiceUnavailableException,
 } from '@nestjs/common';
+import { SchedulerRegistry } from '@nestjs/schedule';
 import { AddressKind, Prisma } from '@prisma/client';
 
 import { priceOrder, type OrderTotals } from '@common/constants/pricing.constants';
@@ -14,7 +15,11 @@ import { DeliveryTiming } from '@common/enums/delivery-timing.enum';
 import { FulfillmentChoice } from '@common/enums/fulfillment-choice.enum';
 import { KycStatus } from '@common/enums/kyc-status.enum';
 import { OrderStatus } from '@common/enums/order-status.enum';
-import { generateOrderCode, generateUlid } from '@common/utils/code-generator.util';
+import {
+  generateOrderCode,
+  generateSecureToken,
+  generateUlid,
+} from '@common/utils/code-generator.util';
 
 import { AuditService } from '@infrastructure/audit/audit.service';
 import { PrismaService } from '@infrastructure/database/prisma.service';
@@ -23,12 +28,14 @@ import { StripeService } from '@infrastructure/stripe/stripe.service';
 
 import { recordTermsAcceptance } from '@modules/compliance/charters/record-terms-acceptance.util';
 import { NotificationsService } from '@modules/notifications/notifications.service';
+import { StrikesService } from '@modules/strikes/strikes.service';
 import { isSubscriptionActive } from '@modules/subscriptions/subscription.util';
 import { CreateAddressDto } from '@modules/users/dto/create-address.dto';
 import { WalletService } from '@modules/wallets/wallets.service';
 
 import { CreateOrderItemDto } from './dto/create-order-item.dto';
 import { CreateOrderDto } from './dto/create-order.dto';
+import { DeliveryProofResponseDto } from './dto/delivery-proof-response.dto';
 import { OrderTrackingResponseDto } from './dto/tracking-response.dto';
 
 import type { Address, Order, OrderItem, OrderItemAddOn } from '@prisma/client';
@@ -42,6 +49,28 @@ type OrderWithEverything = Order & {
 
 type Tx = Prisma.TransactionClient;
 
+/**
+ * No-driver fallback timing. After NO_DRIVER_TIMEOUT_MINUTES with no driver, the
+ * buyer is prompted to switch to pickup or cancel; if they don't answer within
+ * NO_DRIVER_BUYER_RESPONSE_MINUTES, the order is auto-cancelled + refunded.
+ * Env-overridable.
+ */
+const NO_DRIVER_TIMEOUT_MINUTES = Number(process.env.NO_DRIVER_TIMEOUT_MINUTES ?? 15);
+const NO_DRIVER_BUYER_RESPONSE_MINUTES = Number(process.env.NO_DRIVER_BUYER_RESPONSE_MINUTES ?? 10);
+
+/**
+ * Driver-disappeared-after-pickup timing. Once a driver confirms pickup (order
+ * IN_DELIVERY) but never delivers, the timeout fires: the buyer is refunded, the
+ * seller is paid (the dish left the seller), and the driver is not paid. The
+ * stale/radius constants enrich the diagnostic — the timeout itself is the
+ * trigger. Env-overridable.
+ */
+const DRIVER_DELIVERY_TIMEOUT_MINUTES = Number(process.env.DRIVER_DELIVERY_TIMEOUT_MINUTES ?? 60);
+const DRIVER_LOCATION_STALE_MINUTES = Number(process.env.DRIVER_LOCATION_STALE_MINUTES ?? 10);
+const DRIVER_DROPOFF_RADIUS_METERS = Number(process.env.DRIVER_DROPOFF_RADIUS_METERS ?? 250);
+
+export type NoDriverDecision = 'SWITCH_TO_PICKUP' | 'CANCEL_AND_REFUND';
+
 @Injectable()
 export class OrdersService {
   private readonly logger = new Logger(OrdersService.name);
@@ -53,6 +82,8 @@ export class OrdersService {
     private readonly redis: RedisService,
     private readonly notifications: NotificationsService,
     private readonly wallet: WalletService,
+    private readonly scheduler: SchedulerRegistry,
+    private readonly strikes: StrikesService,
   ) {}
 
   /**
@@ -111,6 +142,9 @@ export class OrdersService {
     }
     if (buyer.deletedAt) {
       throw new ForbiddenException('Deleted users cannot place orders');
+    }
+    if (buyer.isSuspended) {
+      throw new ForbiddenException('Votre compte acheteur est suspendu.');
     }
 
     // CGU/CGV must be explicitly accepted at each purchase (client spec).
@@ -372,6 +406,7 @@ export class OrdersService {
       buyer_id: string;
       seller_id: string;
       order_status: string;
+      cancellation_reason: string | null;
       fulfillment_choice: string;
       delivery_id: string | null;
       delivery_status: string | null;
@@ -392,6 +427,7 @@ export class OrdersService {
         o."buyerId"  AS buyer_id,
         o."sellerId" AS seller_id,
         o.status     AS order_status,
+        o."cancellationReason" AS cancellation_reason,
         o."fulfillmentChoice"::text AS fulfillment_choice,
         ST_X(s.location::geometry) AS pickup_lng,
         ST_Y(s.location::geometry) AS pickup_lat,
@@ -436,6 +472,7 @@ export class OrdersService {
 
     return {
       orderStatus: row.order_status,
+      cancellationReason: row.cancellation_reason,
       fulfillmentChoice: row.fulfillment_choice,
       deliveryStatus: row.delivery_status,
       deliveryId: row.delivery_id,
@@ -538,10 +575,17 @@ export class OrdersService {
             // we want SEARCHING ("actively looking for a driver") which
             // is the live-broadcast state.
             status: 'SEARCHING',
+            // Mint the seller→driver pickup-proof token now. The seller shows
+            // it as a QR; the assigned driver scans it to confirm pickup.
+            pickupToken: generateSecureToken(),
           },
         });
       }
     });
+
+    if (newDeliveryId) {
+      this.logger.log(`[PickupQR] generated orderId=${orderId} deliveryId=${newDeliveryId}`);
+    }
 
     await this.publishOrderStatusChanged(orderId, OrderStatus.Ready);
     // Best-effort pushes (self-wrapped; never break the mark-ready commit).
@@ -552,9 +596,804 @@ export class OrdersService {
       );
       if (newDeliveryId) {
         await this.notifications.notifyDeliveryAvailable(orderId, newDeliveryId);
+        // Start the no-driver watchdog: if no driver claims within
+        // NO_DRIVER_TIMEOUT_MINUTES, prompt the buyer to switch/cancel.
+        this.scheduleNoDriverTimeout(orderId, newDeliveryId);
       }
     }
     return this.findOrderWithRelations(orderId);
+  }
+
+  /**
+   * Seller-only: the pickup-proof QR for one of the seller's DELIVERY orders.
+   * Only the order's seller may fetch it; the order must have reached READY
+   * (a Delivery row exists). Lazily mints a token for deliveries created
+   * before this feature. The seller renders `qrData` as a QR and the assigned
+   * driver scans it to confirm pickup.
+   */
+  async getSellerPickupQr(
+    supabaseId: string,
+    orderId: string,
+  ): Promise<{ orderId: string; deliveryId: string; pickupToken: string; qrData: string }> {
+    const sellerId = await this.assertSellerUser(supabaseId);
+    const order = await this.prisma.db.order.findUnique({
+      where: { id: orderId },
+      select: {
+        id: true,
+        sellerId: true,
+        fulfillmentChoice: true,
+        deliveries: {
+          orderBy: { createdAt: 'desc' },
+          take: 1,
+          select: { id: true, pickupToken: true },
+        },
+      },
+    });
+    if (!order) throw new NotFoundException('Order not found');
+    // Only the order's own seller can fetch the pickup QR.
+    if (order.sellerId !== sellerId) {
+      throw new ForbiddenException('Cette commande ne vous appartient pas');
+    }
+    if (order.fulfillmentChoice !== FulfillmentChoice.Delivery) {
+      throw new BadRequestException('Le QR de retrait ne concerne que les commandes en livraison');
+    }
+    // A Delivery row exists only once the order is READY (mark-ready spawns it).
+    const delivery = order.deliveries[0];
+    if (!delivery) {
+      throw new BadRequestException("La commande n'est pas prête pour le retrait");
+    }
+    let token = delivery.pickupToken;
+    if (!token) {
+      token = generateSecureToken();
+      await this.prisma.db.delivery.update({
+        where: { id: delivery.id },
+        data: { pickupToken: token },
+      });
+    }
+    const qrData = `incacook://pickup?orderId=${orderId}&deliveryId=${delivery.id}&token=${token}`;
+    this.logger.log(`[PickupQR] seller fetched QR orderId=${orderId} deliveryId=${delivery.id}`);
+    return { orderId, deliveryId: delivery.id, pickupToken: token, qrData };
+  }
+
+  /**
+   * Buyer-only: the reception-proof QR for one of the buyer's orders that is
+   * currently IN_DELIVERY. Only the order's buyer may fetch it; the delivery
+   * must be assigned and pickup already confirmed. Lazily mints a token for
+   * in-flight orders that predate this feature. The buyer renders `qrData` as
+   * a QR and the assigned driver scans it to confirm delivery.
+   */
+  async getBuyerDeliveryQr(
+    supabaseId: string,
+    orderId: string,
+  ): Promise<{ orderId: string; deliveryId: string; deliveryToken: string; qrData: string }> {
+    const buyer = await this.prisma.db.user.findUnique({
+      where: { supabaseId },
+      select: { id: true },
+    });
+    if (!buyer) throw new NotFoundException('User profile not found');
+
+    const order = await this.prisma.db.order.findUnique({
+      where: { id: orderId },
+      select: {
+        id: true,
+        buyerId: true,
+        status: true,
+        deliveries: {
+          orderBy: { createdAt: 'desc' },
+          take: 1,
+          select: { id: true, driverId: true, pickupConfirmedAt: true, deliveryToken: true },
+        },
+      },
+    });
+    if (!order) throw new NotFoundException('Order not found');
+    // Only the order's own buyer can fetch the reception QR.
+    if (order.buyerId !== buyer.id) {
+      throw new ForbiddenException('Cette commande ne vous appartient pas');
+    }
+    if (order.status !== OrderStatus.InDelivery) {
+      throw new BadRequestException("La commande n'est pas en cours de livraison");
+    }
+    const delivery = order.deliveries[0];
+    // A token only exists once a driver picked the order up.
+    if (!delivery || !delivery.driverId || !delivery.pickupConfirmedAt) {
+      throw new BadRequestException('Le retrait vendeur doit être confirmé avant la livraison');
+    }
+    let token = delivery.deliveryToken;
+    if (!token) {
+      token = generateSecureToken();
+      await this.prisma.db.delivery.update({
+        where: { id: delivery.id },
+        data: { deliveryToken: token },
+      });
+    }
+    const qrData = `incacook://delivery?orderId=${orderId}&deliveryId=${delivery.id}&token=${token}`;
+    this.logger.log(`[DeliveryQR] buyer fetched QR orderId=${orderId} deliveryId=${delivery.id}`);
+    return { orderId, deliveryId: delivery.id, deliveryToken: token, qrData };
+  }
+
+  /**
+   * Delivery completion proof for the order's buyer OR seller. Surfaces the
+   * client-absent photo/GPS/timestamp when the order was left at the door; for
+   * a QR delivery the absent-proof fields are null. Access is gated to the two
+   * order parties — no other user can read the proof.
+   */
+  async getOrderDeliveryProof(
+    supabaseId: string,
+    orderId: string,
+  ): Promise<DeliveryProofResponseDto> {
+    const user = await this.prisma.db.user.findUnique({
+      where: { supabaseId },
+      select: { id: true },
+    });
+    if (!user) throw new NotFoundException('User profile not found');
+
+    const order = await this.prisma.db.order.findUnique({
+      where: { id: orderId },
+      select: {
+        id: true,
+        buyerId: true,
+        sellerId: true,
+        deliveries: {
+          orderBy: { createdAt: 'desc' },
+          take: 1,
+          select: {
+            id: true,
+            status: true,
+            deliveredAt: true,
+            deliveredAsAbsent: true,
+            absentProofPhotoUrl: true,
+            absentProofLat: true,
+            absentProofLng: true,
+            absentProofTakenAt: true,
+            absentProofNote: true,
+            absentProofContactAttemptedAt: true,
+          },
+        },
+      },
+    });
+    if (!order) throw new NotFoundException('Order not found');
+    // Only the order's buyer or seller can read the proof.
+    if (order.buyerId !== user.id && order.sellerId !== user.id) {
+      throw new ForbiddenException('Cette commande ne vous appartient pas');
+    }
+    const delivery = order.deliveries[0];
+    if (!delivery) {
+      throw new NotFoundException('No delivery for this order');
+    }
+    return {
+      orderId,
+      deliveryId: delivery.id,
+      deliveredAsAbsent: delivery.deliveredAsAbsent,
+      status: delivery.status,
+      deliveredAt: delivery.deliveredAt?.toISOString() ?? null,
+      photoUrl: delivery.absentProofPhotoUrl ?? null,
+      lat: delivery.absentProofLat ?? null,
+      lng: delivery.absentProofLng ?? null,
+      takenAt: delivery.absentProofTakenAt?.toISOString() ?? null,
+      note: delivery.absentProofNote ?? null,
+      contactAttemptedAt: delivery.absentProofContactAttemptedAt?.toISOString() ?? null,
+    };
+  }
+
+  // -----------------------------------------------------------------------
+  // No-driver-available fallback
+  // -----------------------------------------------------------------------
+
+  private noDriverTimeoutKey(orderId: string): string {
+    return `no-driver:${orderId}`;
+  }
+
+  private noDriverResponseKey(orderId: string): string {
+    return `no-driver-response:${orderId}`;
+  }
+
+  /** Removes an in-flight scheduled timeout by name (no-op if absent). */
+  private clearTimer(key: string): void {
+    try {
+      if (this.scheduler.doesExist('timeout', key)) {
+        this.scheduler.deleteTimeout(key);
+      }
+    } catch {
+      // best-effort
+    }
+  }
+
+  /**
+   * Arms the no-driver watchdog for a freshly-searching delivery. After
+   * NO_DRIVER_TIMEOUT_MINUTES, [handleNoDriverTimeout] runs in-process. Survives
+   * as a one-shot timer (not Redis-durable) — a process restart drops it, which
+   * is acceptable for this fallback.
+   */
+  scheduleNoDriverTimeout(orderId: string, deliveryId: string): void {
+    const key = this.noDriverTimeoutKey(orderId);
+    this.clearTimer(key);
+    const timer = setTimeout(() => {
+      this.clearTimer(key);
+      void this.handleNoDriverTimeout(orderId).catch((err) =>
+        this.logger.error(
+          `[NoDriverTimeout] handler failed orderId=${orderId}: ${(err as Error).message}`,
+        ),
+      );
+    }, NO_DRIVER_TIMEOUT_MINUTES * 60_000);
+    this.scheduler.addTimeout(key, timer);
+    this.logger.log(
+      `[NoDriverTimeout] scheduled orderId=${orderId} deliveryId=${deliveryId} in=${NO_DRIVER_TIMEOUT_MINUTES}min`,
+    );
+  }
+
+  /** Arms the buyer-response watchdog once the no-driver prompt is shown. */
+  private scheduleNoDriverResponseTimeout(orderId: string): void {
+    const key = this.noDriverResponseKey(orderId);
+    this.clearTimer(key);
+    const timer = setTimeout(() => {
+      this.clearTimer(key);
+      void this.autoCancelNoResponse(orderId).catch((err) =>
+        this.logger.error(
+          `[NoDriverTimeout] auto-cancel failed orderId=${orderId}: ${(err as Error).message}`,
+        ),
+      );
+    }, NO_DRIVER_BUYER_RESPONSE_MINUTES * 60_000);
+    this.scheduler.addTimeout(key, timer);
+  }
+
+  /**
+   * No-driver watchdog body. If the delivery is still unclaimed and the order is
+   * still a READY DELIVERY, flips it to NO_DRIVER_AVAILABLE, notifies the buyer,
+   * and arms the buyer-response auto-cancel. Idempotent / safe to re-run.
+   */
+  async handleNoDriverTimeout(orderId: string): Promise<void> {
+    const order = await this.prisma.db.order.findUnique({
+      where: { id: orderId },
+      select: {
+        id: true,
+        status: true,
+        buyerId: true,
+        fulfillmentChoice: true,
+        deliveries: {
+          orderBy: { createdAt: 'desc' },
+          take: 1,
+          select: { id: true, status: true, driverId: true },
+        },
+      },
+    });
+    if (!order) {
+      this.logger.log(`[NoDriverTimeout] skipped reason=order-missing orderId=${orderId}`);
+      return;
+    }
+    const delivery = order.deliveries[0];
+    // A driver already grabbed it → nothing to do.
+    if (delivery?.driverId || (delivery && delivery.status !== 'SEARCHING')) {
+      this.logger.log(`[NoDriverTimeout] skipped reason=claimed orderId=${orderId}`);
+      return;
+    }
+    // Order moved on (cancelled, switched, already prompted, etc.).
+    if (
+      order.status !== OrderStatus.Ready ||
+      order.fulfillmentChoice !== FulfillmentChoice.Delivery
+    ) {
+      this.logger.log(`[NoDriverTimeout] skipped reason=already-resolved orderId=${orderId}`);
+      return;
+    }
+
+    await this.prisma.db.order.update({
+      where: { id: orderId },
+      data: { status: 'NO_DRIVER_AVAILABLE' },
+    });
+    this.logger.log(`[NoDriverTimeout] triggered orderId=${orderId}`);
+    await this.publishOrderStatusChanged(orderId, OrderStatus.NoDriverAvailable);
+
+    await this.notifications.sendToUsers([order.buyerId], {
+      title: 'Aucun livreur disponible',
+      body: 'Aucun livreur disponible pour le moment. Voulez-vous récupérer votre commande en ramassage ?',
+      data: { type: 'no_driver_available', orderId },
+    });
+
+    this.scheduleNoDriverResponseTimeout(orderId);
+  }
+
+  /**
+   * Buyer's decision after a no-driver prompt. Only the order's buyer may
+   * decide, and only while the order is NO_DRIVER_AVAILABLE. Either switches the
+   * order to pickup or cancels + refunds it; the seller is never penalised.
+   */
+  async decideNoDriver(
+    supabaseId: string,
+    orderId: string,
+    decision: NoDriverDecision,
+  ): Promise<OrderWithEverything> {
+    const user = await this.prisma.db.user.findUnique({
+      where: { supabaseId },
+      select: { id: true },
+    });
+    if (!user) throw new NotFoundException('User profile not found');
+
+    const order = await this.prisma.db.order.findUnique({
+      where: { id: orderId },
+      select: {
+        id: true,
+        status: true,
+        buyerId: true,
+        sellerId: true,
+        deliveries: { orderBy: { createdAt: 'desc' }, take: 1, select: { id: true } },
+      },
+    });
+    if (!order) throw new NotFoundException('Order not found');
+    // Only the buyer can decide — this also blocks the seller and any driver.
+    if (order.buyerId !== user.id) {
+      throw new ForbiddenException('Seul le client de la commande peut décider');
+    }
+    if (order.status !== OrderStatus.NoDriverAvailable) {
+      throw new ConflictException("Aucune décision n'est requise pour cette commande");
+    }
+
+    // The buyer answered → stop the auto-cancel watchdog.
+    this.clearTimer(this.noDriverResponseKey(orderId));
+
+    if (decision === 'SWITCH_TO_PICKUP') {
+      await this.switchOrderToPickup(
+        order.id,
+        order.sellerId,
+        order.buyerId,
+        order.deliveries[0]?.id,
+      );
+      this.logger.log(`[NoDriverTimeout] buyer decision=SWITCH_TO_PICKUP orderId=${orderId}`);
+    } else {
+      await this.cancelNoDriverOrder(orderId, 'no_driver_buyer_cancelled');
+      this.logger.log(`[NoDriverTimeout] buyer decision=CANCEL_AND_REFUND orderId=${orderId}`);
+    }
+    return this.findOrderWithRelations(orderId);
+  }
+
+  /**
+   * Auto-cancel when the buyer never answers the no-driver prompt. No-op if the
+   * order already moved out of NO_DRIVER_AVAILABLE (buyer decided in time).
+   */
+  async autoCancelNoResponse(orderId: string): Promise<void> {
+    const order = await this.prisma.db.order.findUnique({
+      where: { id: orderId },
+      select: { status: true },
+    });
+    if (!order || order.status !== OrderStatus.NoDriverAvailable) {
+      this.logger.log(`[NoDriverTimeout] skipped reason=already-resolved orderId=${orderId}`);
+      return;
+    }
+    this.logger.log(`[NoDriverTimeout] auto-cancel no response orderId=${orderId}`);
+    await this.cancelNoDriverOrder(orderId, 'buyer_no_response_after_no_driver');
+  }
+
+  /** Switches a no-driver order to PICKUP: cancels the delivery, keeps the buyer's money. */
+  private async switchOrderToPickup(
+    orderId: string,
+    sellerId: string,
+    buyerId: string,
+    deliveryId: string | undefined,
+  ): Promise<void> {
+    await this.prisma.$transaction(async (tx) => {
+      await tx.order.update({
+        where: { id: orderId },
+        data: { status: 'READY', fulfillmentChoice: 'PICKUP' },
+      });
+      if (deliveryId) {
+        await tx.delivery.update({
+          where: { id: deliveryId },
+          data: {
+            status: 'CANCELLED',
+            failedAt: new Date(),
+            failureReason: 'no_driver_switched_to_pickup',
+          },
+        });
+      }
+    });
+    await this.publishOrderStatusChanged(orderId, OrderStatus.Ready);
+    await this.notifications.sendToUsers([sellerId], {
+      title: 'Commande en ramassage',
+      body: 'Le client passera récupérer la commande.',
+      data: { type: 'order_switched_pickup', orderId },
+    });
+    await this.notifications.sendToUsers([buyerId], {
+      title: 'Commande en ramassage',
+      body: 'Votre commande est passée en ramassage.',
+      data: { type: 'order_switched_pickup', orderId },
+    });
+  }
+
+  /**
+   * Cancels a no-driver order, restores inventory (so the seller can re-publish
+   * the dish — no penalty), refunds the buyer, and notifies both parties.
+   */
+  private async cancelNoDriverOrder(orderId: string, reason: string): Promise<void> {
+    const order = await this.prisma.db.order.findUnique({
+      where: { id: orderId },
+      select: {
+        buyerId: true,
+        sellerId: true,
+        inventoryRestored: true,
+        items: { select: { listingId: true, quantity: true } },
+        deliveries: { orderBy: { createdAt: 'desc' }, take: 1, select: { id: true } },
+      },
+    });
+    if (!order) return;
+
+    await this.prisma.$transaction(async (tx) => {
+      if (!order.inventoryRestored) {
+        const restoreByListing = new Map<string, number>();
+        for (const item of order.items) {
+          restoreByListing.set(
+            item.listingId,
+            (restoreByListing.get(item.listingId) ?? 0) + item.quantity,
+          );
+        }
+        for (const [listingId, qty] of restoreByListing) {
+          await tx.$executeRaw`
+            UPDATE "Listing"
+            SET "portionsLeft" = "portionsLeft" + ${qty}
+            WHERE "id" = ${listingId}
+          `;
+        }
+      }
+      await tx.order.update({
+        where: { id: orderId },
+        data: {
+          status: 'CANCELLED',
+          cancelledAt: new Date(),
+          cancellationReason: reason,
+          inventoryRestored: true,
+        },
+      });
+      const deliveryId = order.deliveries[0]?.id;
+      if (deliveryId) {
+        await tx.delivery.update({
+          where: { id: deliveryId },
+          data: { status: 'CANCELLED', failedAt: new Date(), failureReason: reason },
+        });
+      }
+    });
+
+    // Refund via the existing Stripe path (idempotent).
+    await this.refundOrderIfNeeded(orderId);
+    await this.publishOrderStatusChanged(orderId, OrderStatus.Cancelled);
+
+    await this.notifications.sendToUsers([order.buyerId], {
+      title: 'Commande annulée',
+      body: 'Votre commande a été annulée et remboursée.',
+      data: { type: 'order_cancelled', orderId },
+    });
+    await this.notifications.sendToUsers([order.sellerId], {
+      title: 'Commande annulée',
+      body: 'Commande annulée : aucun livreur disponible.',
+      data: { type: 'order_cancelled', orderId },
+    });
+  }
+
+  /**
+   * Driver reported the seller couldn't provide the order at pickup (absent / no
+   * food). Cancels the order, restores inventory (so the seller can re-publish),
+   * refunds the buyer + reverses any seller pending earnings (seller not paid),
+   * and compensates the driver for the trip. Notifies buyer + seller (the driver
+   * is notified by DeliveriesService). The Delivery row itself is cancelled with
+   * the proof by DeliveriesService before this runs.
+   */
+  async cancelForSellerUnavailable(orderId: string, driverId: string): Promise<void> {
+    const order = await this.prisma.db.order.findUnique({
+      where: { id: orderId },
+      select: {
+        status: true,
+        buyerId: true,
+        sellerId: true,
+        fulfillmentFeeCents: true,
+        inventoryRestored: true,
+        items: { select: { listingId: true, quantity: true } },
+      },
+    });
+    if (!order) throw new NotFoundException('Order not found');
+    const resolved: OrderStatus[] = [
+      OrderStatus.Cancelled,
+      OrderStatus.Refunded,
+      OrderStatus.Delivered,
+      OrderStatus.Completed,
+    ];
+    if (resolved.includes(order.status as OrderStatus)) {
+      throw new ConflictException('Commande déjà résolue');
+    }
+
+    await this.prisma.$transaction(async (tx) => {
+      if (!order.inventoryRestored) {
+        const restoreByListing = new Map<string, number>();
+        for (const item of order.items) {
+          restoreByListing.set(
+            item.listingId,
+            (restoreByListing.get(item.listingId) ?? 0) + item.quantity,
+          );
+        }
+        for (const [listingId, qty] of restoreByListing) {
+          await tx.$executeRaw`
+            UPDATE "Listing"
+            SET "portionsLeft" = "portionsLeft" + ${qty}
+            WHERE "id" = ${listingId}
+          `;
+        }
+      }
+      await tx.order.update({
+        where: { id: orderId },
+        data: {
+          status: 'CANCELLED',
+          cancelledAt: new Date(),
+          cancellationReason: 'seller_unavailable',
+          inventoryRestored: true,
+        },
+      });
+    });
+
+    // Buyer refund + reverse any seller PENDING earnings (seller not paid).
+    await this.refundOrderIfNeeded(orderId);
+    this.logger.log(`[SellerUnavailable] refund buyer orderId=${orderId}`);
+
+    // Compensate the driver for the wasted trip (delivery fee).
+    if (driverId && order.fulfillmentFeeCents > 0) {
+      await this.wallet.compensateDriver(orderId, driverId, order.fulfillmentFeeCents);
+    }
+
+    // Seller penalty: a light strike (deduped per delivery). Best-effort — a
+    // strike failure must not break the cancel/refund.
+    try {
+      await this.strikes.addStrike({
+        userId: order.sellerId,
+        role: 'SELLER',
+        points: 1,
+        reason: 'SELLER_UNAVAILABLE',
+        severity: 'LIGHT',
+        sourceType: 'DELIVERY',
+        orderId,
+      });
+    } catch (err) {
+      this.logger.error(
+        `[SellerUnavailable] strike failed orderId=${orderId}: ${(err as Error).message}`,
+      );
+    }
+
+    await this.publishOrderStatusChanged(orderId, OrderStatus.Cancelled);
+
+    await this.notifications.sendToUsers([order.buyerId], {
+      title: 'Commande annulée',
+      body: "Votre commande a été annulée et remboursée car le vendeur n'a pas pu fournir le plat.",
+      data: { type: 'order_cancelled', orderId },
+    });
+    await this.notifications.sendToUsers([order.sellerId], {
+      title: 'Commande annulée',
+      body: 'Commande annulée : plat non disponible au retrait.',
+      data: { type: 'order_cancelled', orderId },
+    });
+  }
+
+  // -----------------------------------------------------------------------
+  // Driver-disappeared-after-pickup fallback
+  // -----------------------------------------------------------------------
+
+  /**
+   * Arms the driver-delivery-timeout watchdog when an order goes IN_DELIVERY
+   * (pickup confirmed). After DRIVER_DELIVERY_TIMEOUT_MINUTES with no delivery
+   * proof, [handleDriverDeliveryTimeout] resolves it. In-process timer (not
+   * Redis-durable); a future BullMQ worker can call the handler directly.
+   */
+  scheduleDriverDeliveryTimeout(orderId: string, deliveryId: string): void {
+    const key = `driver-delivery:${deliveryId}`;
+    this.clearTimer(key);
+    const timer = setTimeout(() => {
+      this.clearTimer(key);
+      void this.handleDriverDeliveryTimeout(deliveryId).catch((err) =>
+        this.logger.error(
+          `[DriverDisappeared] handler failed deliveryId=${deliveryId}: ${(err as Error).message}`,
+        ),
+      );
+    }, DRIVER_DELIVERY_TIMEOUT_MINUTES * 60_000);
+    this.scheduler.addTimeout(key, timer);
+    this.logger.log(
+      `[DriverDisappeared] scheduled deliveryId=${deliveryId} orderId=${orderId} in=${DRIVER_DELIVERY_TIMEOUT_MINUTES}min`,
+    );
+  }
+
+  /**
+   * Driver-disappeared watchdog body. If the driver confirmed pickup but the
+   * order was never delivered (no buyer QR / absent proof) and is still
+   * IN_DELIVERY, refunds the buyer, pays the seller (the dish left the seller),
+   * and does NOT pay the driver. Idempotent / safe to re-run; also callable by
+   * a future admin endpoint or BullMQ worker.
+   */
+  async handleDriverDeliveryTimeout(deliveryId: string): Promise<void> {
+    const delivery = await this.prisma.db.delivery.findUnique({
+      where: { id: deliveryId },
+      select: {
+        id: true,
+        orderId: true,
+        status: true,
+        driverId: true,
+        pickupConfirmedAt: true,
+        deliveredConfirmedAt: true,
+        deliveredAsAbsent: true,
+      },
+    });
+    if (!delivery) {
+      this.logger.log(`[DriverDisappeared] skipped reason=missing deliveryId=${deliveryId}`);
+      return;
+    }
+    // Delivery already completed via buyer QR or absent-dropoff proof.
+    if (
+      delivery.status === 'DELIVERED' ||
+      delivery.deliveredConfirmedAt ||
+      delivery.deliveredAsAbsent
+    ) {
+      this.logger.log(`[DriverDisappeared] skipped reason=delivered deliveryId=${deliveryId}`);
+      return;
+    }
+    // Already resolved (failed / cancelled).
+    if (delivery.status === 'FAILED' || delivery.status === 'CANCELLED') {
+      this.logger.log(
+        `[DriverDisappeared] skipped reason=already-resolved deliveryId=${deliveryId}`,
+      );
+      return;
+    }
+    // Must have been picked up to count as "disappeared after pickup".
+    if (!delivery.pickupConfirmedAt) {
+      this.logger.log(`[DriverDisappeared] skipped reason=not-picked-up deliveryId=${deliveryId}`);
+      return;
+    }
+
+    const order = await this.prisma.db.order.findUnique({
+      where: { id: delivery.orderId },
+      select: {
+        id: true,
+        status: true,
+        buyerId: true,
+        sellerId: true,
+        sellerEarningsCents: true,
+      },
+    });
+    if (!order) {
+      this.logger.log(`[DriverDisappeared] skipped reason=order-missing deliveryId=${deliveryId}`);
+      return;
+    }
+    if (order.status !== OrderStatus.InDelivery) {
+      this.logger.log(
+        `[DriverDisappeared] skipped reason=already-resolved deliveryId=${deliveryId} orderStatus=${order.status}`,
+      );
+      return;
+    }
+
+    // GPS coherence is a diagnostic signal; the timeout itself is the trigger.
+    const gps = await this.describeDriverGps(deliveryId);
+    this.logger.log(
+      `[DriverDisappeared] detected deliveryId=${deliveryId} driverId=${delivery.driverId ?? 'none'} gps=${gps}`,
+    );
+
+    await this.resolveDriverDisappeared(
+      delivery.orderId,
+      deliveryId,
+      delivery.driverId,
+      order.buyerId,
+      order.sellerId,
+      order.sellerEarningsCents,
+    );
+  }
+
+  private async resolveDriverDisappeared(
+    orderId: string,
+    deliveryId: string,
+    driverId: string | null,
+    buyerId: string,
+    sellerId: string,
+    sellerEarningsCents: number,
+  ): Promise<void> {
+    // Delivery FAILED + order CANCELLED. Inventory is NOT restored — the dish
+    // already left the seller.
+    await this.prisma.$transaction(async (tx) => {
+      await tx.delivery.update({
+        where: { id: deliveryId },
+        data: {
+          status: 'FAILED',
+          failedAt: new Date(),
+          failureReason: 'driver_disappeared',
+        },
+      });
+      await tx.order.update({
+        where: { id: orderId },
+        data: {
+          status: 'CANCELLED',
+          cancelledAt: new Date(),
+          cancellationReason: 'driver_disappeared',
+        },
+      });
+    });
+
+    // Reverse any driver pending earning for this order (normally none — the
+    // driver earning is only created on a confirmed delivery).
+    const reversed = await this.prisma.db.walletEntry.updateMany({
+      where: { orderId, type: 'DELIVERY_EARNING', status: 'PENDING' },
+      data: { status: 'CANCELLED' },
+    });
+    if (reversed.count > 0) {
+      this.logger.log(`[DriverDisappeared] driver earning cancelled orderId=${orderId}`);
+    }
+
+    // Refund the buyer (idempotent; never delivered).
+    await this.refundOrderIfNeeded(orderId);
+    this.logger.log(`[DriverDisappeared] refund buyer orderId=${orderId}`);
+
+    // Pay the seller — they handed the dish to the driver. AVAILABLE
+    // immediately: the order is cancelled, so a PENDING entry would be reversed
+    // by the 24h release sweep.
+    if (sellerEarningsCents > 0) {
+      await this.wallet.creditSellerEarning(orderId, sellerId, sellerEarningsCents);
+      this.logger.log(`[DriverDisappeared] seller paid orderId=${orderId}`);
+    }
+
+    // Driver penalty: critical infraction → immediate exclusion. Best-effort —
+    // a strike failure must not break the refund/seller-pay.
+    if (driverId) {
+      try {
+        await this.strikes.immediateExclude(driverId, 'DRIVER', 'DRIVER_DISAPPEARED_AFTER_PICKUP', {
+          sourceType: 'DELIVERY',
+          deliveryId,
+          orderId,
+        });
+      } catch (err) {
+        this.logger.error(
+          `[DriverDisappeared] exclusion failed driverId=${driverId}: ${(err as Error).message}`,
+        );
+      }
+    }
+
+    await this.publishOrderStatusChanged(orderId, OrderStatus.Cancelled);
+
+    await this.notifications.sendToUsers([buyerId], {
+      title: 'Commande remboursée',
+      body: "Votre commande a été remboursée car la livraison n'a pas été effectuée.",
+      data: { type: 'order_cancelled', orderId },
+    });
+    await this.notifications.sendToUsers([sellerId], {
+      title: 'Paiement maintenu',
+      body: 'Le plat a été récupéré par le livreur. Votre paiement est maintenu.',
+      data: { type: 'driver_disappeared', orderId },
+    });
+    if (driverId) {
+      await this.notifications.sendToUsers([driverId], {
+        title: 'Incident de livraison',
+        body: 'Incident de livraison enregistré.',
+        data: { type: 'driver_disappeared', orderId },
+      });
+    }
+  }
+
+  /**
+   * Best-effort GPS coherence for the disappearance log: whether the driver's
+   * last fix is stale (older than DRIVER_LOCATION_STALE_MINUTES) or far from the
+   * dropoff (beyond DRIVER_DROPOFF_RADIUS_METERS). Diagnostic only — never gates
+   * the decision. Returns 'unknown' if the query can't run.
+   */
+  private async describeDriverGps(deliveryId: string): Promise<string> {
+    try {
+      const rows = await this.prisma.$queryRaw<
+        Array<{ stale: boolean | null; far: boolean | null }>
+      >`
+        SELECT
+          (dp."lastSeenAt" IS NULL
+            OR dp."lastSeenAt" < NOW() - (${DRIVER_LOCATION_STALE_MINUTES} || ' minutes')::interval) AS stale,
+          (dp."lastKnownPoint" IS NULL OR a.point IS NULL
+            OR NOT ST_DWithin(dp."lastKnownPoint", a.point, ${DRIVER_DROPOFF_RADIUS_METERS})) AS far
+        FROM "Delivery" d
+        JOIN "Order" o ON o.id = d."orderId"
+        LEFT JOIN "DriverProfile" dp ON dp."userId" = d."driverId"
+        LEFT JOIN "Address" a ON a.id = o."dropoffAddressId"
+        WHERE d.id = ${deliveryId}
+        LIMIT 1;
+      `;
+      const r = rows[0];
+      if (!r) return 'unknown';
+      if (r.stale) return 'stale';
+      if (r.far) return 'far';
+      return 'fresh-near';
+    } catch {
+      return 'unknown';
+    }
   }
 
   /**
@@ -1368,5 +2207,16 @@ export class OrdersService {
         amountCents: order.buyerTotalCents,
       },
     });
+
+    // Wallet safety: if earnings were credited PENDING (delivered then refunded
+    // within the 24h window), reverse them so they never become withdrawable.
+    // No-op for orders refunded before delivery (no pending entries exist).
+    const reversed = await this.prisma.db.walletEntry.updateMany({
+      where: { orderId, status: 'PENDING' },
+      data: { status: 'CANCELLED' },
+    });
+    if (reversed.count > 0) {
+      this.logger.log(`[WalletRelease] skipped reason=refunded orderId=${orderId}`);
+    }
   }
 }

@@ -1,20 +1,18 @@
 import {
+  BadRequestException,
   ConflictException,
   ForbiddenException,
-  HttpStatus,
   Injectable,
   Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { DeliveryStatus } from '@prisma/client';
 
-import { ErrorCodes } from '@common/constants/error-codes.constants';
 import { IssueSeverity } from '@common/enums/issue-severity.enum';
 import { KycStatus } from '@common/enums/kyc-status.enum';
 import { OrderStatus } from '@common/enums/order-status.enum';
 import { UserRole } from '@common/enums/user-role.enum';
-import { DomainException } from '@common/exceptions/domain.exception';
-import { generateUlid } from '@common/utils/code-generator.util';
+import { generateSecureToken, generateUlid } from '@common/utils/code-generator.util';
 
 import { AuditService } from '@infrastructure/audit/audit.service';
 import { PrismaService } from '@infrastructure/database/prisma.service';
@@ -25,10 +23,14 @@ import { NotificationsService } from '@modules/notifications/notifications.servi
 import { OrdersService } from '@modules/orders/orders.service';
 import { driverLocChannel } from '@modules/tracking/tracking.gateway';
 
+import { ConfirmAbsentDropoffDto } from './dto/confirm-absent-dropoff.dto';
+import { ConfirmDeliveryDto } from './dto/confirm-delivery.dto';
+import { ConfirmPickupDto } from './dto/confirm-pickup.dto';
 import { DeliveryEnrichment } from './dto/delivery-response.dto';
 import { DriverLocationDto } from './dto/driver-location.dto';
 import { OnlineStatusDto } from './dto/online-status.dto';
 import { ReportIssueDto } from './dto/report-issue.dto';
+import { ReportSellerUnavailableDto } from './dto/report-seller-unavailable.dto';
 
 import type { Delivery, Order } from '@prisma/client';
 
@@ -85,6 +87,11 @@ export class DeliveriesService {
 
   async setOnline(supabaseId: string, dto: OnlineStatusDto): Promise<void> {
     const driver = await this.assertDriver(supabaseId);
+
+    // Suspended/excluded drivers can't go online (offline is always allowed).
+    if (dto.isOnline && driver.isSuspended) {
+      throw new ForbiddenException('Votre compte livreur est suspendu.');
+    }
 
     // Dev fallback: in production a driver must have an admin-approved
     // KYC submission before going online. In NODE_ENV=development we
@@ -385,18 +392,20 @@ export class DeliveriesService {
    */
   async claim(supabaseId: string, deliveryId: string): Promise<DeliveryWithRelations> {
     const driver = await this.assertDriver(supabaseId);
+    // Suspended/excluded drivers can't claim deliveries.
+    if (driver.isSuspended) {
+      throw new ForbiddenException('Votre compte livreur est suspendu.');
+    }
     const isDev = process.env.NODE_ENV === 'development';
 
-    // Safe diagnostics for the payout/KYC gate (no secrets — id presence only).
-    const kycApproved = driver.kycStatus === KycStatus.Approved;
-    const canClaim = isDev || (kycApproved && driver.stripeOnboardingCompleted);
+    // Safe diagnostics (no secrets — id presence only).
     this.logger.log(`[DriverClaim] kycStatus=${driver.kycStatus}`);
     this.logger.log(
       `[DriverClaim] stripeConnectAccountId=${driver.stripeConnectAccountId ? 'present' : 'missing'}`,
     );
     this.logger.log(`[DriverClaim] stripeOnboardingCompleted=${driver.stripeOnboardingCompleted}`);
-    this.logger.log(`[DriverClaim] canClaim=${canClaim}`);
 
+    // KYC stays mandatory to claim.
     if (driver.kycStatus !== KycStatus.Approved) {
       if (isDev) {
         await this.prisma.db.driverProfile.update({
@@ -408,29 +417,13 @@ export class DeliveriesService {
         throw new ForbiddenException('Driver KYC must be APPROVED to claim deliveries');
       }
     }
-    if (!driver.stripeOnboardingCompleted) {
-      if (isDev) {
-        // Local-dev convenience ONLY: skip real payout setup so claims work
-        // without a Stripe Connect account. A developer can also set this by
-        // hand: `UPDATE "DriverProfile" SET "stripeOnboardingCompleted" = true
-        // WHERE "userId" = '<id>';`. REAL payout tests still need a real
-        // Stripe Connect account id (stripeConnectAccountId) — this flag alone
-        // does NOT make transfers succeed.
-        await this.prisma.db.driverProfile.update({
-          where: { userId: driver.userId },
-          data: { stripeOnboardingCompleted: true },
-        });
-        this.logger.debug(`[dev] auto-completed Stripe Connect for ${driver.userId}`);
-      } else {
-        // Typed code so the app can map this to a clear "set up payments" CTA
-        // instead of showing the raw backend message. Status stays 403.
-        throw new DomainException(
-          ErrorCodes.PayoutOnboardingIncomplete,
-          'Complete Stripe Connect onboarding before claiming deliveries',
-          HttpStatus.FORBIDDEN,
-        );
-      }
-    }
+
+    // Stripe Connect onboarding is deliberately NOT required to claim. The
+    // driver delivers + earns into the internal wallet now; payout setup is
+    // enforced only at withdrawal (WalletService.requestWithdrawal).
+    this.logger.log(
+      '[DriverClaim] allowed without Stripe onboarding; cashout will be blocked until payout setup',
+    );
 
     // Race-safe atomic claim.
     const updated = await this.prisma.$executeRaw`
@@ -486,65 +479,402 @@ export class DeliveriesService {
    * IN_DELIVERY (we collapse Order's transient PICKED_UP and IN_DELIVERY
    * into a single "in delivery" state for the buyer's UI).
    */
-  async confirmPickup(supabaseId: string, deliveryId: string): Promise<DeliveryWithRelations> {
+  async confirmPickup(
+    supabaseId: string,
+    deliveryId: string,
+    dto: ConfirmPickupDto,
+  ): Promise<DeliveryWithRelations> {
     const driver = await this.assertDriver(supabaseId);
+    // Asserts the delivery is claimed by THIS driver (else 403 with the
+    // "not assigned to this driver" message).
     const delivery = await this.loadDeliveryForDriver(deliveryId, driver.userId);
 
-    if (delivery.status !== DeliveryStatus.AT_PICKUP) {
-      throw new ConflictException(
-        `Delivery is in ${delivery.status}; confirm-pickup requires AT_PICKUP`,
-      );
+    // Idempotency / replay: a second scan must not re-run the transition.
+    const POST_PICKUP: DeliveryStatus[] = [
+      DeliveryStatus.PICKED_UP,
+      DeliveryStatus.EN_ROUTE_TO_DROPOFF,
+      DeliveryStatus.AT_DROPOFF,
+      DeliveryStatus.DELIVERED,
+    ];
+    if (delivery.pickupConfirmedAt || POST_PICKUP.includes(delivery.status)) {
+      this.logger.warn(`[PickupQR] scan failed reason=already_confirmed deliveryId=${deliveryId}`);
+      throw new ConflictException('Retrait déjà confirmé');
     }
+
+    // Pickup can be confirmed from any claimed pre-pickup state (the driver
+    // scans the seller's QR at the counter).
+    const PRE_PICKUP: DeliveryStatus[] = [
+      DeliveryStatus.ASSIGNED,
+      DeliveryStatus.EN_ROUTE_TO_PICKUP,
+      DeliveryStatus.AT_PICKUP,
+    ];
+    if (!PRE_PICKUP.includes(delivery.status)) {
+      this.logger.warn(
+        `[PickupQR] scan failed reason=not_ready deliveryId=${deliveryId} status=${delivery.status}`,
+      );
+      throw new ConflictException("La commande n'est pas prête pour le retrait");
+    }
+
+    // Token must match the one minted for THIS delivery's pickup QR.
+    if (!delivery.pickupToken || delivery.pickupToken !== dto.pickupToken) {
+      this.logger.warn(`[PickupQR] scan failed reason=invalid_token deliveryId=${deliveryId}`);
+      throw new BadRequestException('QR code invalide');
+    }
+
+    const lat = typeof dto.lat === 'number' ? dto.lat : null;
+    const lng = typeof dto.lng === 'number' ? dto.lng : null;
+    const now = new Date();
+    // Mint the buyer→driver delivery (dropoff) token now that the order is
+    // IN_DELIVERY, so the buyer can show their reception QR.
+    const deliveryToken = generateSecureToken();
 
     await this.prisma.$transaction(async (tx) => {
       await tx.delivery.update({
         where: { id: deliveryId },
-        data: { status: DeliveryStatus.PICKED_UP, pickedUpAt: new Date() },
+        data: {
+          status: DeliveryStatus.PICKED_UP,
+          pickedUpAt: now,
+          pickupConfirmedAt: now,
+          pickupConfirmedByDriverId: driver.userId,
+          pickupLat: lat,
+          pickupLng: lng,
+          deliveryToken,
+        },
       });
       await tx.order.update({
         where: { id: delivery.orderId },
         data: { status: 'IN_DELIVERY' },
       });
     });
+
+    this.logger.log(`[PickupQR] scan success deliveryId=${deliveryId} driverId=${driver.userId}`);
+    this.logger.log(`[DeliveryQR] generated orderId=${delivery.orderId} deliveryId=${deliveryId}`);
     // Buyer's tracking stepper jumps to "En route" the moment this lands.
     await this.orders.publishOrderStatusChanged(delivery.orderId, OrderStatus.InDelivery);
-    // Buyer push: order picked up, now en route.
+    // Push: buyer ("Votre commande est en livraison") + seller ("Le livreur a
+    // récupéré la commande") — both via the shared delivery-event copy.
     await this.notifications.notifyDeliveryEvent(delivery.orderId, deliveryId, 'order_picked_up', {
       buyer: true,
+      seller: true,
     });
+
+    // Arm the driver-disappeared watchdog: if the order is never delivered, the
+    // buyer is refunded and the seller is paid after the timeout.
+    this.orders.scheduleDriverDeliveryTimeout(delivery.orderId, deliveryId);
 
     return this.loadDelivery(deliveryId);
   }
 
   /**
-   * PICKED_UP → DELIVERED. Order → DELIVERED. Triggers Stripe transfers
-   * to seller and driver via OrdersService.confirmDeliveredByDriver.
+   * Driver scans the buyer's reception QR → DELIVERED. Requires the buyer's
+   * `deliveryToken` (proof the order reached the client); optional GPS is
+   * stored as delivery proof. Triggers payout via confirmDeliveredByDriver.
    */
-  async confirmDelivery(supabaseId: string, deliveryId: string): Promise<DeliveryWithRelations> {
+  async confirmDelivery(
+    supabaseId: string,
+    deliveryId: string,
+    dto: ConfirmDeliveryDto,
+  ): Promise<DeliveryWithRelations> {
     const driver = await this.assertDriver(supabaseId);
+    // Asserts the delivery is claimed by THIS driver.
     const delivery = await this.loadDeliveryForDriver(deliveryId, driver.userId);
 
-    if (delivery.status !== DeliveryStatus.PICKED_UP) {
-      throw new ConflictException(
-        `Delivery is in ${delivery.status}; confirm-delivery requires PICKED_UP`,
+    // Idempotency / replay: a second scan must not re-run the transition.
+    if (delivery.deliveredConfirmedAt || delivery.status === DeliveryStatus.DELIVERED) {
+      this.logger.warn(
+        `[DeliveryQR] scan failed reason=already_delivered deliveryId=${deliveryId}`,
       );
+      throw new ConflictException('Livraison déjà confirmée');
     }
+
+    // Must be out for delivery (pickup already confirmed).
+    const OUT_FOR_DELIVERY: DeliveryStatus[] = [
+      DeliveryStatus.PICKED_UP,
+      DeliveryStatus.EN_ROUTE_TO_DROPOFF,
+      DeliveryStatus.AT_DROPOFF,
+    ];
+    if (!OUT_FOR_DELIVERY.includes(delivery.status)) {
+      const PRE_PICKUP: DeliveryStatus[] = [
+        DeliveryStatus.UNASSIGNED,
+        DeliveryStatus.SEARCHING,
+        DeliveryStatus.ASSIGNED,
+        DeliveryStatus.EN_ROUTE_TO_PICKUP,
+        DeliveryStatus.AT_PICKUP,
+      ];
+      this.logger.warn(
+        `[DeliveryQR] scan failed reason=not_in_delivery deliveryId=${deliveryId} status=${delivery.status}`,
+      );
+      if (PRE_PICKUP.includes(delivery.status)) {
+        throw new ConflictException('Le retrait vendeur doit être confirmé avant la livraison');
+      }
+      throw new ConflictException("La commande n'est pas en cours de livraison");
+    }
+
+    // Token must match the buyer's reception QR for THIS delivery.
+    if (!delivery.deliveryToken || delivery.deliveryToken !== dto.deliveryToken) {
+      this.logger.warn(`[DeliveryQR] scan failed reason=invalid_token deliveryId=${deliveryId}`);
+      throw new BadRequestException('QR code invalide');
+    }
+
+    const lat = typeof dto.lat === 'number' ? dto.lat : null;
+    const lng = typeof dto.lng === 'number' ? dto.lng : null;
+    const now = new Date();
 
     await this.prisma.db.delivery.update({
       where: { id: deliveryId },
-      data: { status: DeliveryStatus.DELIVERED, deliveredAt: new Date() },
+      data: {
+        status: DeliveryStatus.DELIVERED,
+        deliveredAt: now,
+        deliveredConfirmedAt: now,
+        deliveredConfirmedByDriverId: driver.userId,
+        deliveredLat: lat,
+        deliveredLng: lng,
+      },
     });
 
-    // Order transition + payout. Idempotent in OrdersService.
+    // Order → DELIVERED + payout + buyer status broadcast. Idempotent.
     await this.orders.confirmDeliveredByDriver(delivery.orderId);
 
-    // Buyer + seller push: delivered.
+    this.logger.log(`[DeliveryQR] scan success deliveryId=${deliveryId} driverId=${driver.userId}`);
+    // Buyer + seller push: "Commande livrée".
     await this.notifications.notifyDeliveryEvent(
       delivery.orderId,
       deliveryId,
       'delivery_completed',
       { buyer: true, seller: true },
     );
+    // Driver push: "Livraison confirmée" (best-effort — they also get in-app
+    // confirmation; a notify failure must not fail the delivery).
+    try {
+      await this.notifications.sendToUsers([driver.userId], {
+        title: 'Livraison',
+        body: 'Livraison confirmée',
+        data: { type: 'delivery_completed', orderId: delivery.orderId, deliveryId },
+      });
+    } catch {
+      // ignore — best effort
+    }
+
+    return this.loadDelivery(deliveryId);
+  }
+
+  /**
+   * Client-absent fallback: the driver leaves the order at the door with a
+   * mandatory photo + GPS (server stamps the timestamp). No buyer QR scan is
+   * required — the delivery is confirmed (DELIVERED), payouts proceed, and the
+   * buyer is not refunded. Same driver/state guards as the QR confirm.
+   */
+  async confirmAbsentDropoff(
+    supabaseId: string,
+    deliveryId: string,
+    dto: ConfirmAbsentDropoffDto,
+  ): Promise<DeliveryWithRelations> {
+    const driver = await this.assertDriver(supabaseId);
+    // Asserts the delivery is claimed by THIS driver.
+    const delivery = await this.loadDeliveryForDriver(deliveryId, driver.userId);
+
+    // Idempotency / replay: a second confirmation must not re-run the transition.
+    if (delivery.deliveredConfirmedAt || delivery.status === DeliveryStatus.DELIVERED) {
+      this.logger.warn(`[AbsentProof] failed reason=already_delivered deliveryId=${deliveryId}`);
+      throw new ConflictException('Livraison déjà confirmée');
+    }
+
+    // Must be out for delivery (pickup already confirmed).
+    const OUT_FOR_DELIVERY: DeliveryStatus[] = [
+      DeliveryStatus.PICKED_UP,
+      DeliveryStatus.EN_ROUTE_TO_DROPOFF,
+      DeliveryStatus.AT_DROPOFF,
+    ];
+    if (!OUT_FOR_DELIVERY.includes(delivery.status)) {
+      const PRE_PICKUP: DeliveryStatus[] = [
+        DeliveryStatus.UNASSIGNED,
+        DeliveryStatus.SEARCHING,
+        DeliveryStatus.ASSIGNED,
+        DeliveryStatus.EN_ROUTE_TO_PICKUP,
+        DeliveryStatus.AT_PICKUP,
+      ];
+      this.logger.warn(
+        `[AbsentProof] failed reason=not_in_delivery deliveryId=${deliveryId} status=${delivery.status}`,
+      );
+      if (PRE_PICKUP.includes(delivery.status)) {
+        throw new ConflictException('Le retrait vendeur doit être confirmé avant la livraison');
+      }
+      throw new ConflictException("La commande n'est pas en cours de livraison");
+    }
+
+    // Proof is mandatory: photo + GPS.
+    const photoUrl = dto.photoUrl?.trim();
+    if (!photoUrl) {
+      this.logger.warn(`[AbsentProof] failed reason=missing_photo deliveryId=${deliveryId}`);
+      throw new BadRequestException("Photo obligatoire pour confirmer l'absence du client");
+    }
+    if (
+      typeof dto.lat !== 'number' ||
+      typeof dto.lng !== 'number' ||
+      Number.isNaN(dto.lat) ||
+      Number.isNaN(dto.lng)
+    ) {
+      this.logger.warn(`[AbsentProof] failed reason=missing_gps deliveryId=${deliveryId}`);
+      throw new BadRequestException('Position GPS obligatoire');
+    }
+
+    const now = new Date();
+    await this.prisma.db.delivery.update({
+      where: { id: deliveryId },
+      data: {
+        status: DeliveryStatus.DELIVERED,
+        deliveredAt: now,
+        deliveredConfirmedAt: now,
+        deliveredConfirmedByDriverId: driver.userId,
+        deliveredLat: dto.lat,
+        deliveredLng: dto.lng,
+        deliveredAsAbsent: true,
+        absentProofPhotoUrl: photoUrl,
+        absentProofLat: dto.lat,
+        absentProofLng: dto.lng,
+        absentProofTakenAt: now,
+        absentProofNote: dto.note?.trim() || null,
+      },
+    });
+
+    // Order → DELIVERED + payout + buyer status broadcast. Idempotent.
+    await this.orders.confirmDeliveredByDriver(delivery.orderId);
+
+    this.logger.log(`[AbsentProof] success deliveryId=${deliveryId} driverId=${driver.userId}`);
+
+    // Custom pushes: the buyer message differs from the QR flow ("déposée avec
+    // une photo de preuve"). Best-effort — a notify failure must not fail the
+    // delivery.
+    try {
+      const parties = await this.prisma.db.order.findUnique({
+        where: { id: delivery.orderId },
+        select: { buyerId: true, sellerId: true },
+      });
+      const data = { type: 'delivery_completed', orderId: delivery.orderId, deliveryId };
+      if (parties?.buyerId) {
+        await this.notifications.sendToUsers([parties.buyerId], {
+          title: 'Commande livrée',
+          body: 'Votre commande a été déposée avec une photo de preuve.',
+          data,
+        });
+      }
+      if (parties?.sellerId) {
+        await this.notifications.sendToUsers([parties.sellerId], {
+          title: 'Commande livrée',
+          body: 'Commande livrée.',
+          data,
+        });
+      }
+      await this.notifications.sendToUsers([driver.userId], {
+        title: 'Livraison',
+        body: 'Livraison confirmée.',
+        data,
+      });
+    } catch {
+      // ignore — best effort
+    }
+
+    return this.loadDelivery(deliveryId);
+  }
+
+  /**
+   * Driver arrived at the seller but no order could be provided (seller absent /
+   * no food), BEFORE pickup was confirmed. Cancels the delivery with the report
+   * proof, then (via OrdersService) cancels + refunds the order, reverses any
+   * seller pending earnings, and compensates the driver for the trip. Same
+   * driver/state guards as the other driver actions.
+   */
+  async reportSellerUnavailable(
+    supabaseId: string,
+    deliveryId: string,
+    dto: ReportSellerUnavailableDto,
+  ): Promise<DeliveryWithRelations> {
+    const driver = await this.assertDriver(supabaseId);
+    // Asserts the delivery is claimed by THIS driver (else 403).
+    const delivery = await this.loadDeliveryForDriver(deliveryId, driver.userId);
+
+    // Duplicate report (already reported / cancelled / failed).
+    if (
+      delivery.sellerUnavailableAt ||
+      delivery.status === DeliveryStatus.CANCELLED ||
+      delivery.status === DeliveryStatus.FAILED
+    ) {
+      this.logger.warn(`[SellerUnavailable] failed reason=duplicate deliveryId=${deliveryId}`);
+      throw new ConflictException('Signalement déjà enregistré');
+    }
+
+    // Pickup must NOT be confirmed yet.
+    const POST_PICKUP: DeliveryStatus[] = [
+      DeliveryStatus.PICKED_UP,
+      DeliveryStatus.EN_ROUTE_TO_DROPOFF,
+      DeliveryStatus.AT_DROPOFF,
+      DeliveryStatus.DELIVERED,
+    ];
+    if (delivery.pickupConfirmedAt || POST_PICKUP.includes(delivery.status)) {
+      this.logger.warn(
+        `[SellerUnavailable] failed reason=already_picked_up deliveryId=${deliveryId}`,
+      );
+      throw new ConflictException('Le retrait a déjà été confirmé');
+    }
+
+    // Order must not already be resolved.
+    const order = await this.prisma.db.order.findUnique({
+      where: { id: delivery.orderId },
+      select: { status: true },
+    });
+    if (!order) throw new NotFoundException('Order not found');
+    const resolved = ['CANCELLED', 'REFUNDED', 'DELIVERED', 'COMPLETED'];
+    if (resolved.includes(order.status)) {
+      this.logger.warn(
+        `[SellerUnavailable] failed reason=already_resolved deliveryId=${deliveryId}`,
+      );
+      throw new ConflictException('Commande déjà résolue');
+    }
+
+    // GPS is mandatory proof of presence at the seller.
+    if (
+      typeof dto.lat !== 'number' ||
+      typeof dto.lng !== 'number' ||
+      Number.isNaN(dto.lat) ||
+      Number.isNaN(dto.lng)
+    ) {
+      this.logger.warn(`[SellerUnavailable] failed reason=missing_gps deliveryId=${deliveryId}`);
+      throw new BadRequestException('Position GPS obligatoire');
+    }
+
+    const now = new Date();
+    await this.prisma.db.delivery.update({
+      where: { id: deliveryId },
+      data: {
+        status: DeliveryStatus.CANCELLED,
+        failedAt: now,
+        failureReason: `seller_unavailable:${dto.reason}`,
+        sellerUnavailableReason: dto.reason,
+        sellerUnavailableAt: now,
+        sellerUnavailableLat: dto.lat,
+        sellerUnavailableLng: dto.lng,
+        sellerUnavailableNote: dto.note?.trim() || null,
+        sellerUnavailablePhotoUrl: dto.photoUrl?.trim() || null,
+      },
+    });
+    this.logger.log(
+      `[SellerUnavailable] report deliveryId=${deliveryId} driverId=${driver.userId} reason=${dto.reason}`,
+    );
+
+    // Cancel + refund the order, reverse seller pending earnings, compensate
+    // the driver, and notify buyer + seller.
+    await this.orders.cancelForSellerUnavailable(delivery.orderId, driver.userId);
+
+    // Driver acknowledgement (best-effort).
+    try {
+      await this.notifications.sendToUsers([driver.userId], {
+        title: 'Signalement enregistré',
+        body: 'Signalement enregistré. Vous serez indemnisé pour le déplacement.',
+        data: { type: 'seller_unavailable', deliveryId, orderId: delivery.orderId },
+      });
+    } catch {
+      // best-effort
+    }
 
     return this.loadDelivery(deliveryId);
   }
@@ -627,10 +957,11 @@ export class DeliveriesService {
     kycStatus: KycStatus;
     stripeOnboardingCompleted: boolean;
     stripeConnectAccountId: string | null;
+    isSuspended: boolean;
   }> {
     const user = await this.prisma.db.user.findUnique({
       where: { supabaseId },
-      select: { id: true, role: true, driverProfile: true },
+      select: { id: true, role: true, isSuspended: true, driverProfile: true },
     });
     if (!user) {
       throw new NotFoundException('User profile not found');
@@ -643,22 +974,43 @@ export class DeliveriesService {
       kycStatus: user.driverProfile.kycStatus as KycStatus,
       stripeOnboardingCompleted: user.driverProfile.stripeOnboardingCompleted,
       stripeConnectAccountId: user.driverProfile.stripeConnectAccountId,
+      isSuspended: user.isSuspended,
     };
   }
 
   private async loadDeliveryForDriver(
     deliveryId: string,
     driverUserId: string,
-  ): Promise<{ id: string; orderId: string; status: DeliveryStatus; driverId: string | null }> {
+  ): Promise<{
+    id: string;
+    orderId: string;
+    status: DeliveryStatus;
+    driverId: string | null;
+    pickupToken: string | null;
+    pickupConfirmedAt: Date | null;
+    deliveryToken: string | null;
+    deliveredConfirmedAt: Date | null;
+    sellerUnavailableAt: Date | null;
+  }> {
     const delivery = await this.prisma.db.delivery.findUnique({
       where: { id: deliveryId },
-      select: { id: true, orderId: true, status: true, driverId: true },
+      select: {
+        id: true,
+        orderId: true,
+        status: true,
+        driverId: true,
+        pickupToken: true,
+        pickupConfirmedAt: true,
+        deliveryToken: true,
+        deliveredConfirmedAt: true,
+        sellerUnavailableAt: true,
+      },
     });
     if (!delivery) {
       throw new NotFoundException('Delivery not found');
     }
     if (delivery.driverId !== driverUserId) {
-      throw new ForbiddenException("Cannot act on another driver's delivery");
+      throw new ForbiddenException("Cette livraison n'est pas assignée à ce livreur");
     }
     return delivery;
   }

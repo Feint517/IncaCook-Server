@@ -124,7 +124,7 @@ export class ListingsService {
       requireKycApproved?: boolean;
       requireActiveSubscription?: boolean;
     } = {},
-  ): Promise<{ sellerId: string; profile: SellerProfile }> {
+  ): Promise<{ sellerId: string; profile: SellerProfile; isSuspended: boolean }> {
     const user = await this.prisma.db.user.findUnique({
       where: { supabaseId },
       include: { sellerProfile: true },
@@ -155,14 +155,22 @@ export class ListingsService {
         throw new ForbiddenException('SUBSCRIPTION_INACTIVE');
       }
     }
-    return { sellerId: user.id, profile: user.sellerProfile };
+    return { sellerId: user.id, profile: user.sellerProfile, isSuspended: user.isSuspended };
   }
 
   async create(supabaseId: string, dto: CreateListingDto): Promise<ListingWithAddOns> {
-    const { sellerId, profile: seller } = await this.assertSeller(supabaseId, {
+    const {
+      sellerId,
+      profile: seller,
+      isSuspended,
+    } = await this.assertSeller(supabaseId, {
       requireKycApproved: true,
       requireActiveSubscription: true,
     });
+    // Suspended sellers cannot publish new listings.
+    if (isSuspended) {
+      throw new ForbiddenException('Votre compte vendeur est suspendu.');
+    }
     if (!seller.category) {
       throw new ForbiddenException('Complete your seller profile before creating listings');
     }

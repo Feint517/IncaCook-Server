@@ -56,6 +56,14 @@ const PURPOSE_RULES: Record<
         ? 'Fait-maison sellers do not have a storefront facade'
         : null,
   },
+  // Client-absent delivery proof photo. Only the assigned driver uploads it.
+  // Reuses the public `avatars` bucket (ulid path, same posture as every other
+  // user image) so the buyer/seller can view the proof via publicImageUrl; the
+  // proof METADATA endpoint is what gates access by order party.
+  [UploadPurpose.DeliveryProof]: {
+    bucketConfigKey: 'avatars',
+    allowedRoles: new Set([UserRole.Driver]),
+  },
 };
 
 @Injectable()

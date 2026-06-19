@@ -19,12 +19,16 @@ import { AddressResponseDto } from '@modules/users/dto/address-response.dto';
 
 import { CancelOrderDto } from './dto/cancel-order.dto';
 import { CreateOrderDto } from './dto/create-order.dto';
+import { DeliveryProofResponseDto } from './dto/delivery-proof-response.dto';
+import { DeliveryQrResponseDto } from './dto/delivery-qr-response.dto';
 import { ListOrdersQueryDto } from './dto/list-orders.query.dto';
+import { NoDriverDecisionDto } from './dto/no-driver-decision.dto';
 import {
   CreateOrderResponseDto,
   OrderListResponseDto,
   OrderResponseDto,
 } from './dto/order-response.dto';
+import { PickupQrResponseDto } from './dto/pickup-qr-response.dto';
 import { OrderTrackingResponseDto } from './dto/tracking-response.dto';
 import { OrdersService } from './orders.service';
 
@@ -122,6 +126,46 @@ export class OrdersController {
       offset,
       hasMore: result.hasMore,
     };
+  }
+
+  /**
+   * Seller pickup-proof QR for a DELIVERY order. Only the order's seller can
+   * fetch it; the order must be READY. The assigned driver scans the returned
+   * payload to confirm pickup.
+   */
+  @Get('sellers/me/orders/:orderId/pickup-qr')
+  sellerPickupQr(
+    @CurrentUser() jwtUser: AuthenticatedUser,
+    @Param('orderId') orderId: string,
+  ): Promise<PickupQrResponseDto> {
+    return this.orders.getSellerPickupQr(jwtUser.id, orderId);
+  }
+
+  /**
+   * Buyer-only: the reception-proof QR for one of the buyer's orders. Only the
+   * order's buyer may fetch it; the order must be IN_DELIVERY with pickup
+   * already confirmed. The assigned driver scans the returned payload to
+   * confirm delivery.
+   */
+  @Get('orders/:orderId/delivery-qr')
+  buyerDeliveryQr(
+    @CurrentUser() jwtUser: AuthenticatedUser,
+    @Param('orderId') orderId: string,
+  ): Promise<DeliveryQrResponseDto> {
+    return this.orders.getBuyerDeliveryQr(jwtUser.id, orderId);
+  }
+
+  /**
+   * Delivery completion proof for the order's buyer or seller (only). Surfaces
+   * the client-absent photo + GPS + timestamp when the order was left at the
+   * door; absent-proof fields are null for a normal QR delivery.
+   */
+  @Get('orders/:orderId/delivery-proof')
+  deliveryProof(
+    @CurrentUser() jwtUser: AuthenticatedUser,
+    @Param('orderId') orderId: string,
+  ): Promise<DeliveryProofResponseDto> {
+    return this.orders.getOrderDeliveryProof(jwtUser.id, orderId);
   }
 
   /**
@@ -236,6 +280,24 @@ export class OrdersController {
     @Body() dto: CancelOrderDto,
   ): Promise<OrderResponseDto> {
     const order = await this.orders.cancelAsSeller(jwtUser.id, id, dto.reason);
+    return OrderResponseDto.from(
+      order,
+      order.dropoffAddress ? AddressResponseDto.from(order.dropoffAddress, null) : null,
+    );
+  }
+
+  /**
+   * Buyer's decision when no driver accepted the delivery (order is
+   * NO_DRIVER_AVAILABLE): switch to pickup, or cancel + refund. Buyer-only.
+   */
+  @Post('orders/:orderId/no-driver-decision')
+  @HttpCode(HttpStatus.OK)
+  async noDriverDecision(
+    @CurrentUser() jwtUser: AuthenticatedUser,
+    @Param('orderId') orderId: string,
+    @Body() dto: NoDriverDecisionDto,
+  ): Promise<OrderResponseDto> {
+    const order = await this.orders.decideNoDriver(jwtUser.id, orderId, dto.decision);
     return OrderResponseDto.from(
       order,
       order.dropoffAddress ? AddressResponseDto.from(order.dropoffAddress, null) : null,

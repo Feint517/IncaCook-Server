@@ -1,3 +1,5 @@
+import { randomBytes } from 'node:crypto';
+
 import { customAlphabet } from 'nanoid';
 import { ulid } from 'ulid';
 
@@ -17,3 +19,10 @@ export const generateOrderCode = (length = 8): string => {
   const make = customAlphabet(ORDER_ALPHABET, length);
   return make();
 };
+
+/**
+ * Cryptographically-random, URL-safe token (default 24 bytes → 32 chars).
+ * Used for the seller→driver pickup-proof QR: high entropy so it can't be
+ * guessed, and unique enough to key a delivery by.
+ */
+export const generateSecureToken = (bytes = 24): string => randomBytes(bytes).toString('base64url');

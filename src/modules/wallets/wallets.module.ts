@@ -1,5 +1,7 @@
 import { Module } from '@nestjs/common';
 
+import { NotificationsModule } from '@modules/notifications/notifications.module';
+
 import { AdminOrderFinancialsController, WalletController } from './wallets.controller';
 import { WalletService } from './wallets.service';
 
@@ -10,6 +12,7 @@ import { WalletService } from './wallets.service';
  * WalletService so OrdersService can credit on delivery / reception.
  */
 @Module({
+  imports: [NotificationsModule],
   controllers: [WalletController, AdminOrderFinancialsController],
   providers: [WalletService],
   exports: [WalletService],

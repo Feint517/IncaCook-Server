@@ -45,9 +45,12 @@ export const ErrorCodes = {
   // Drivers
   NoDriverAvailable: 'INCACOOK_NO_DRIVER_AVAILABLE',
   DriverOffline: 'INCACOOK_DRIVER_OFFLINE',
-  // Seller/driver hasn't finished Stripe Connect payout onboarding — blocks
-  // claiming deliveries (and, later, any payout-bearing action).
+  // Seller/driver hasn't finished Stripe Connect payout onboarding.
   PayoutOnboardingIncomplete: 'INCACOOK_PAYOUT_ONBOARDING_INCOMPLETE',
+  // Withdrawal/cashout attempted before Stripe Connect payout setup is
+  // complete. Drivers can deliver + earn without it; it's only required to
+  // move money out. The app maps this to a "set up payments" prompt.
+  PayoutSetupRequired: 'INCACOOK_PAYOUT_SETUP_REQUIRED',
 } as const;
 
 export type ErrorCode = (typeof ErrorCodes)[keyof typeof ErrorCodes];

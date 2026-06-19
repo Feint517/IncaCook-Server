@@ -197,6 +197,7 @@ enum OrderStatus {
   IN_DELIVERY
   DELIVERED
   COMPLETED
+  NO_DRIVER_AVAILABLE
   CANCELLED
   REFUNDED
   DISPUTED
@@ -248,6 +249,13 @@ model User {
 
   // GDPR: erasure is performed by anonymising this row, not deleting.
   deletedAt DateTime?
+
+  // Account suspension via the strikes system. A suspended user is blocked from
+  // their role's actions (driver online/claim, seller publish, buyer order).
+  isSuspended      Boolean   @default(false)
+  suspendedAt      DateTime?
+  suspensionReason String?
+
   createdAt DateTime  @default(now())
   updatedAt DateTime  @updatedAt
 
@@ -263,6 +271,7 @@ model User {
 
   kycDocuments       KycDocument[] @relation("KycAuthor")
   kycReviewsAuthored KycDocument[] @relation("KycReviewer")
+  strikes            Strike[]
 
   charters UserCharter[]
 
@@ -974,6 +983,48 @@ model Delivery {
 
   proofOfDeliveryPath String? // Supabase Storage path
 
+  // Seller → driver pickup proof. A secure token is minted when the Delivery
+  // is created (mark-ready); the seller shows it as a QR and the assigned
+  // driver scans it to confirm the dish left the seller. Distinct from the
+  // (future) buyer delivery proof.
+  pickupToken               String?   @unique
+  pickupConfirmedAt         DateTime?
+  pickupConfirmedByDriverId String?
+  pickupLat                 Float?
+  pickupLng                 Float?
+
+  // Buyer → driver delivery proof. A token is minted when pickup is confirmed
+  // (order goes IN_DELIVERY); the buyer shows it as a QR and the assigned
+  // driver scans it to confirm the order reached the client.
+  deliveryToken                String?   @unique
+  deliveredConfirmedAt         DateTime?
+  deliveredConfirmedByDriverId String?
+  deliveredLat                 Float?
+  deliveredLng                 Float?
+
+  // Client-absent fallback. When the buyer is absent/unreachable, the driver
+  // may leave the order at the door WITHOUT a QR scan, proving it with a
+  // mandatory photo + GPS + server timestamp. Delivery is then confirmed and
+  // payouts proceed (buyer is not refunded). `deliveredAsAbsent` flags which
+  // proof path completed the delivery.
+  deliveredAsAbsent             Boolean   @default(false)
+  absentProofPhotoUrl           String?
+  absentProofLat                Float?
+  absentProofLng                Float?
+  absentProofTakenAt            DateTime?
+  absentProofContactAttemptedAt DateTime?
+  absentProofNote               String?
+
+  // Seller-unavailable-at-pickup report. The driver arrived but the seller was
+  // absent / had no food: the order is cancelled + buyer refunded, the seller
+  // is not paid, and the driver is compensated for the trip.
+  sellerUnavailableReason   String?
+  sellerUnavailableAt       DateTime?
+  sellerUnavailableLat      Float?
+  sellerUnavailableLng      Float?
+  sellerUnavailableNote     String?
+  sellerUnavailablePhotoUrl String?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -1312,6 +1363,40 @@ enum WalletEntryStatus {
   CANCELLED
 }
 
+/// Account penalty point shared by sellers, drivers, and buyers. Light = 1pt,
+/// serious = 2pts; 3 active points (createdAt within 90 days) → suspension, and
+/// a CRITICAL strike can exclude immediately. Old strikes stay in history but
+/// stop counting after [expiresAt]. The (user, role, reason, source) shape is
+/// deduped in code so one incident never strikes twice.
+model Strike {
+  id         String   @id
+  userId     String
+  user       User     @relation(fields: [userId], references: [id])
+  // SELLER | DRIVER | BUYER — which role the strike applies to.
+  actorRole  String
+  points     Int
+  // Stable reason code, e.g. SELLER_UNAVAILABLE | DRIVER_DISAPPEARED_AFTER_PICKUP.
+  reason     String
+  // LIGHT | SERIOUS | CRITICAL.
+  severity   String
+  // DELIVERY | ORDER | REPORT | SYSTEM.
+  sourceType String
+  sourceId   String?
+  orderId    String?
+  deliveryId String?
+  notes      String?
+  // Admin/user id that created it, or null for SYSTEM-generated strikes.
+  createdBy  String?
+  metadata   Json?
+  createdAt  DateTime  @default(now())
+  // createdAt + 90 days: a strike counts toward the threshold only while
+  // now < expiresAt.
+  expiresAt  DateTime?
+
+  @@index([userId, actorRole, createdAt])
+  @@index([userId, actorRole, reason])
+}
+
 model WalletEntry {
   id           String            @id
   // Beneficiary User.id (seller or driver); 'PLATFORM' for COMMISSION rows.
@@ -1324,7 +1409,10 @@ model WalletEntry {
   status       WalletEntryStatus @default(AVAILABLE)
   // Groups a payout: the WITHDRAWAL debit + the entries it paid out.
   withdrawalId String?
+  // PENDING earnings become AVAILABLE only after [availableAt] (delivery + 24h);
+  // [releasedAt] records when the release job actually flipped them.
   availableAt  DateTime?
+  releasedAt   DateTime?
   metadata     Json?
   createdAt    DateTime          @default(now())
   updatedAt    DateTime          @updatedAt

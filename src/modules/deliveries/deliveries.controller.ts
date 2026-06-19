@@ -4,11 +4,15 @@ import { CurrentUser } from '@common/decorators/current-user.decorator';
 import type { AuthenticatedUser } from '@common/types/authenticated-request.type';
 
 import { DeliveriesService } from './deliveries.service';
+import { ConfirmAbsentDropoffDto } from './dto/confirm-absent-dropoff.dto';
+import { ConfirmDeliveryDto } from './dto/confirm-delivery.dto';
+import { ConfirmPickupDto } from './dto/confirm-pickup.dto';
 import { DeliveryListResponseDto, DeliveryResponseDto } from './dto/delivery-response.dto';
 import { DriverLocationDto } from './dto/driver-location.dto';
 import { ListDeliveriesQueryDto } from './dto/list-deliveries.query.dto';
 import { OnlineStatusDto } from './dto/online-status.dto';
 import { ReportIssueDto } from './dto/report-issue.dto';
+import { ReportSellerUnavailableDto } from './dto/report-seller-unavailable.dto';
 
 /**
  * All driver-facing delivery endpoints. No class-level path so we can
@@ -112,29 +116,66 @@ export class DeliveriesController {
   }
 
   /**
-   * AT_PICKUP → PICKED_UP. Driver has the food. Order → IN_DELIVERY.
+   * Driver scans the seller's pickup QR → PICKED_UP, Order → IN_DELIVERY.
+   * Requires the QR's `pickupToken` (proof the dish left the seller); optional
+   * GPS is stored as pickup proof.
    */
   @Post('drivers/me/deliveries/:id/confirm-pickup')
   @HttpCode(HttpStatus.OK)
   async confirmPickup(
     @CurrentUser() jwtUser: AuthenticatedUser,
     @Param('id') id: string,
+    @Body() dto: ConfirmPickupDto,
   ): Promise<DeliveryResponseDto> {
-    const delivery = await this.deliveries.confirmPickup(jwtUser.id, id);
+    const delivery = await this.deliveries.confirmPickup(jwtUser.id, id, dto);
     return DeliveryResponseDto.from(delivery);
   }
 
   /**
-   * PICKED_UP → DELIVERED. Order → DELIVERED. Triggers Stripe transfers
-   * to seller and driver via OrdersService.confirmDeliveredByDriver.
+   * Driver scans the buyer's reception QR → DELIVERED, Order → DELIVERED.
+   * Requires the QR's `deliveryToken`; optional GPS is stored as delivery
+   * proof. Triggers Stripe transfers via confirmDeliveredByDriver.
    */
   @Post('drivers/me/deliveries/:id/confirm-delivery')
   @HttpCode(HttpStatus.OK)
   async confirmDelivery(
     @CurrentUser() jwtUser: AuthenticatedUser,
     @Param('id') id: string,
+    @Body() dto: ConfirmDeliveryDto,
   ): Promise<DeliveryResponseDto> {
-    const delivery = await this.deliveries.confirmDelivery(jwtUser.id, id);
+    const delivery = await this.deliveries.confirmDelivery(jwtUser.id, id, dto);
+    return DeliveryResponseDto.from(delivery);
+  }
+
+  /**
+   * Client-absent fallback → DELIVERED, Order → DELIVERED. The driver leaves
+   * the order at the door with a mandatory photo + GPS (no buyer QR scan).
+   * Triggers Stripe transfers via confirmDeliveredByDriver; buyer not refunded.
+   */
+  @Post('drivers/me/deliveries/:id/confirm-absent-dropoff')
+  @HttpCode(HttpStatus.OK)
+  async confirmAbsentDropoff(
+    @CurrentUser() jwtUser: AuthenticatedUser,
+    @Param('id') id: string,
+    @Body() dto: ConfirmAbsentDropoffDto,
+  ): Promise<DeliveryResponseDto> {
+    const delivery = await this.deliveries.confirmAbsentDropoff(jwtUser.id, id, dto);
+    return DeliveryResponseDto.from(delivery);
+  }
+
+  /**
+   * Driver reports the seller couldn't provide the order at pickup (absent / no
+   * food), BEFORE pickup is confirmed. Cancels + refunds the order, doesn't pay
+   * the seller, and compensates the driver for the trip.
+   */
+  @Post('drivers/me/deliveries/:id/report-seller-unavailable')
+  @HttpCode(HttpStatus.OK)
+  async reportSellerUnavailable(
+    @CurrentUser() jwtUser: AuthenticatedUser,
+    @Param('id') id: string,
+    @Body() dto: ReportSellerUnavailableDto,
+  ): Promise<DeliveryResponseDto> {
+    const delivery = await this.deliveries.reportSellerUnavailable(jwtUser.id, id, dto);
     return DeliveryResponseDto.from(delivery);
   }
 
