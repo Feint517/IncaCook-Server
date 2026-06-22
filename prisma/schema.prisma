@@ -1397,6 +1397,39 @@ model Strike {
   @@index([userId, actorRole, reason])
 }
 
+/// Buyer post-delivery claim. Drives auto-refund for proven never-received /
+/// wrong-order cases, and routes sensitive cases (spoiled food, food poisoning,
+/// proven-delivery never-received) to admin review. Subjective dissatisfaction
+/// is rejected with no refund. Relation-less (plain orderId/buyerId/sellerId)
+/// to avoid touching the Order model.
+model OrderDispute {
+  id         String @id
+  orderId    String
+  buyerId    String
+  sellerId   String
+  deliveryId String?
+  // NEVER_RECEIVED | WRONG_ORDER | SPOILED_FOOD | FOOD_POISONING | SUBJECTIVE_DISSATISFACTION
+  type       String
+  // OPEN | AUTO_REFUNDED | REJECTED | ADMIN_REVIEW | RESOLVED
+  status     String
+
+  description     String?
+  photoUrls       Json?
+  proofFileUrls   Json?
+  refundRequested Boolean @default(false)
+  refundApproved  Boolean @default(false)
+  refundAmountCents Int?
+  adminNotes      String?
+
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+  resolvedAt DateTime?
+
+  @@index([orderId])
+  @@index([status])
+  @@index([buyerId])
+}
+
 model WalletEntry {
   id           String            @id
   // Beneficiary User.id (seller or driver); 'PLATFORM' for COMMISSION rows.

@@ -18,6 +18,8 @@ import type { AuthenticatedUser } from '@common/types/authenticated-request.type
 import { AddressResponseDto } from '@modules/users/dto/address-response.dto';
 
 import { CancelOrderDto } from './dto/cancel-order.dto';
+import { CannotProvideDto } from './dto/cannot-provide.dto';
+import { CreateDisputeDto } from './dto/create-dispute.dto';
 import { CreateOrderDto } from './dto/create-order.dto';
 import { DeliveryProofResponseDto } from './dto/delivery-proof-response.dto';
 import { DeliveryQrResponseDto } from './dto/delivery-qr-response.dto';
@@ -302,5 +304,39 @@ export class OrdersController {
       order,
       order.dropoffAddress ? AddressResponseDto.from(order.dropoffAddress, null) : null,
     );
+  }
+
+  /**
+   * Seller proactively cancels an order they can't fulfil ("Je ne peux pas
+   * fournir"), before pickup. Refunds the buyer, cancels any delivery, and adds
+   * a light seller strike. Seller-only.
+   */
+  @Post('sellers/me/orders/:orderId/cannot-provide')
+  @HttpCode(HttpStatus.OK)
+  async cannotProvide(
+    @CurrentUser() jwtUser: AuthenticatedUser,
+    @Param('orderId') orderId: string,
+    @Body() dto: CannotProvideDto,
+  ): Promise<OrderResponseDto> {
+    const order = await this.orders.sellerCannotProvide(jwtUser.id, orderId, dto);
+    return OrderResponseDto.from(
+      order,
+      order.dropoffAddress ? AddressResponseDto.from(order.dropoffAddress, null) : null,
+    );
+  }
+
+  /**
+   * Buyer files a post-delivery claim (never received, wrong order, spoiled
+   * food, food poisoning, or subjective dissatisfaction). Auto-refunds the
+   * allowed cases; routes sensitive ones to admin review. Buyer-only.
+   */
+  @Post('orders/:orderId/disputes')
+  @HttpCode(HttpStatus.CREATED)
+  async createDispute(
+    @CurrentUser() jwtUser: AuthenticatedUser,
+    @Param('orderId') orderId: string,
+    @Body() dto: CreateDisputeDto,
+  ): Promise<{ dispute: unknown; message: string }> {
+    return this.orders.createDispute(jwtUser.id, orderId, dto);
   }
 }

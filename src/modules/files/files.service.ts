@@ -64,6 +64,12 @@ const PURPOSE_RULES: Record<
     bucketConfigKey: 'avatars',
     allowedRoles: new Set([UserRole.Driver]),
   },
+  // Buyer post-delivery dispute proof (problem photos, medical certificate).
+  // Reuses the public `avatars` bucket (ulid path) like the other proof images.
+  [UploadPurpose.DisputeProof]: {
+    bucketConfigKey: 'avatars',
+    allowedRoles: new Set([UserRole.Buyer]),
+  },
 };
 
 @Injectable()

@@ -181,7 +181,8 @@ export class SellersService {
     const sellers = await this.prisma.db.sellerProfile.findMany({
       where: {
         displayName: { not: null },
-        user: { deletedAt: null },
+        // Suspended sellers are hidden from the buyer "kitchens" feed.
+        user: { deletedAt: null, isSuspended: false },
       },
       include: { cuisines: true },
       orderBy: [{ averageRating: { sort: 'desc', nulls: 'last' } }, { reviewCount: 'desc' }],

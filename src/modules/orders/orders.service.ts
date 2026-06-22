@@ -8,7 +8,7 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { SchedulerRegistry } from '@nestjs/schedule';
-import { AddressKind, Prisma } from '@prisma/client';
+import { AddressKind, OrderDispute, Prisma } from '@prisma/client';
 
 import { priceOrder, type OrderTotals } from '@common/constants/pricing.constants';
 import { DeliveryTiming } from '@common/enums/delivery-timing.enum';
@@ -33,6 +33,7 @@ import { isSubscriptionActive } from '@modules/subscriptions/subscription.util';
 import { CreateAddressDto } from '@modules/users/dto/create-address.dto';
 import { WalletService } from '@modules/wallets/wallets.service';
 
+import { CreateDisputeDto, DisputeStatus } from './dto/create-dispute.dto';
 import { CreateOrderItemDto } from './dto/create-order-item.dto';
 import { CreateOrderDto } from './dto/create-order.dto';
 import { DeliveryProofResponseDto } from './dto/delivery-proof-response.dto';
@@ -1165,6 +1166,175 @@ export class OrdersService {
     });
   }
 
+  /**
+   * Seller proactively cancels an order they can't fulfil ("Je ne peux pas
+   * fournir"), BEFORE pickup is confirmed. Refunds the buyer, restores
+   * inventory, cancels any in-flight delivery, reverses seller pending earnings
+   * (not paid), and adds a LIGHT seller strike. No driver compensation by
+   * default (logged as pending when a driver was assigned).
+   */
+  async sellerCannotProvide(
+    supabaseId: string,
+    orderId: string,
+    dto: { reason?: string; note?: string },
+  ): Promise<OrderWithEverything> {
+    const sellerId = await this.assertSellerUser(supabaseId);
+    const order = await this.prisma.db.order.findUnique({
+      where: { id: orderId },
+      select: {
+        id: true,
+        status: true,
+        buyerId: true,
+        sellerId: true,
+        inventoryRestored: true,
+        items: { select: { listingId: true, quantity: true } },
+        deliveries: {
+          orderBy: { createdAt: 'desc' },
+          take: 1,
+          select: { id: true, status: true, pickupConfirmedAt: true, driverId: true },
+        },
+      },
+    });
+    if (!order) throw new NotFoundException('Order not found');
+    if (order.sellerId !== sellerId) {
+      throw new ForbiddenException('Cette commande ne vous appartient pas');
+    }
+
+    this.logger.log(`[SellerCannotProvide] requested orderId=${orderId} sellerId=${sellerId}`);
+
+    const delivery = order.deliveries[0];
+    // Pickup already confirmed → the dish left the seller; this path no longer applies.
+    if (
+      delivery?.pickupConfirmedAt ||
+      order.status === OrderStatus.InDelivery ||
+      order.status === OrderStatus.PickedUp
+    ) {
+      throw new ConflictException('Le retrait a déjà été confirmé');
+    }
+    // Already terminal.
+    const resolved: OrderStatus[] = [
+      OrderStatus.Cancelled,
+      OrderStatus.Refunded,
+      OrderStatus.Delivered,
+      OrderStatus.Completed,
+    ];
+    if (resolved.includes(order.status as OrderStatus)) {
+      throw new ConflictException('Commande déjà résolue');
+    }
+    // Only cancellable from a paid, pre-pickup state.
+    const cancellableFrom: OrderStatus[] = [
+      OrderStatus.Confirmed,
+      OrderStatus.Preparing,
+      OrderStatus.Ready,
+    ];
+    if (!cancellableFrom.includes(order.status as OrderStatus)) {
+      throw new BadRequestException("Impossible d'annuler cette commande");
+    }
+
+    const reason = dto.reason?.trim() || 'seller_cannot_provide';
+
+    await this.prisma.$transaction(async (tx) => {
+      if (!order.inventoryRestored) {
+        const restoreByListing = new Map<string, number>();
+        for (const item of order.items) {
+          restoreByListing.set(
+            item.listingId,
+            (restoreByListing.get(item.listingId) ?? 0) + item.quantity,
+          );
+        }
+        for (const [listingId, qty] of restoreByListing) {
+          await tx.$executeRaw`
+            UPDATE "Listing"
+            SET "portionsLeft" = "portionsLeft" + ${qty}
+            WHERE "id" = ${listingId}
+          `;
+        }
+      }
+      await tx.order.update({
+        where: { id: orderId },
+        data: {
+          status: 'CANCELLED',
+          cancelledAt: new Date(),
+          cancellationReason: 'seller_cannot_provide',
+          inventoryRestored: true,
+        },
+      });
+      // Cancel any in-flight delivery (searching / assigned, not picked up).
+      if (delivery && delivery.status !== 'CANCELLED' && delivery.status !== 'FAILED') {
+        await tx.delivery.update({
+          where: { id: delivery.id },
+          data: {
+            status: 'CANCELLED',
+            failedAt: new Date(),
+            failureReason: 'seller_cannot_provide',
+          },
+        });
+      }
+    });
+    this.logger.log(`[SellerCannotProvide] inventory restored orderId=${orderId}`);
+    if (delivery) {
+      this.logger.log(`[SellerCannotProvide] delivery cancelled deliveryId=${delivery.id}`);
+    }
+
+    // Buyer refund + reverse any seller PENDING earnings (seller not paid).
+    await this.refundOrderIfNeeded(orderId);
+    this.logger.log(`[SellerCannotProvide] refund buyer orderId=${orderId}`);
+
+    // Seller LIGHT strike (best-effort; deduped per order).
+    try {
+      await this.strikes.addStrike({
+        userId: order.sellerId,
+        role: 'SELLER',
+        points: 1,
+        reason: 'SELLER_CANNOT_PROVIDE',
+        severity: 'LIGHT',
+        sourceType: 'ORDER',
+        orderId,
+        notes: dto.note?.trim() || reason,
+      });
+      this.logger.log(`[SellerCannotProvide] seller strike added sellerId=${order.sellerId}`);
+    } catch (err) {
+      this.logger.error(
+        `[SellerCannotProvide] strike failed orderId=${orderId}: ${(err as Error).message}`,
+      );
+    }
+
+    // Driver compensation: not auto-paid here. Logged when a driver was assigned
+    // (pre-pickup) so the future compensation policy can hook in.
+    if (delivery?.driverId) {
+      this.logger.log(
+        `[SellerCannotProvide] driver compensation pending deliveryId=${delivery.id}`,
+      );
+    }
+
+    await this.publishOrderStatusChanged(orderId, OrderStatus.Cancelled);
+
+    // Best-effort notifications.
+    try {
+      await this.notifications.sendToUsers([order.buyerId], {
+        title: 'Commande annulée',
+        body: 'Votre commande a été annulée et remboursée car le vendeur ne peut pas la fournir.',
+        data: { type: 'order_cancelled', orderId },
+      });
+      await this.notifications.sendToUsers([order.sellerId], {
+        title: 'Commande annulée',
+        body: 'Commande annulée. Un strike a été ajouté.',
+        data: { type: 'order_cancelled', orderId },
+      });
+      if (delivery?.driverId) {
+        await this.notifications.sendToUsers([delivery.driverId], {
+          title: 'Commande annulée',
+          body: 'La commande a été annulée par le vendeur.',
+          data: { type: 'delivery_cancelled', orderId, deliveryId: delivery.id },
+        });
+      }
+    } catch {
+      // best-effort
+    }
+
+    return this.findOrderWithRelations(orderId);
+  }
+
   // -----------------------------------------------------------------------
   // Driver-disappeared-after-pickup fallback
   // -----------------------------------------------------------------------
@@ -1668,6 +1838,12 @@ export class OrdersService {
     if (seller.user.deletedAt) {
       throw new BadRequestException('Seller account is unavailable');
     }
+    // Suspended sellers receive no new orders — guards against cached/deep-linked
+    // listings that bypass the feed filter.
+    if (seller.user.isSuspended) {
+      this.logger.warn(`[Strikes] blocked order from suspended seller sellerId=${sellerId}`);
+      throw new BadRequestException('Ce vendeur est actuellement suspendu.');
+    }
     // Mandatory platform subscription — a seller without an active $4/mo
     // subscription cannot receive new orders.
     if (!isSubscriptionActive(seller.subscriptionStatus, seller.subscriptionCurrentPeriodEnd)) {
@@ -2126,6 +2302,322 @@ export class OrdersService {
       throw new NotFoundException('Order not found');
     }
     return order;
+  }
+
+  // -----------------------------------------------------------------------
+  // Buyer post-delivery disputes / refund requests
+  // -----------------------------------------------------------------------
+
+  /**
+   * Buyer files a post-delivery claim. Auto-refunds the allowed cases
+   * (proven-undelivered NEVER_RECEIVED, WRONG_ORDER); routes sensitive cases
+   * (proven-delivery NEVER_RECEIVED, SPOILED_FOOD, FOOD_POISONING) to admin
+   * review; rejects SUBJECTIVE_DISSATISFACTION with no refund. Idempotent on
+   * refund. Returns the dispute + a buyer-facing message.
+   */
+  async createDispute(
+    supabaseId: string,
+    orderId: string,
+    dto: CreateDisputeDto,
+  ): Promise<{ dispute: OrderDispute; message: string }> {
+    const buyer = await this.prisma.db.user.findUnique({
+      where: { supabaseId },
+      select: { id: true },
+    });
+    if (!buyer) throw new NotFoundException('User profile not found');
+
+    const order = await this.prisma.db.order.findUnique({
+      where: { id: orderId },
+      select: {
+        id: true,
+        buyerId: true,
+        sellerId: true,
+        status: true,
+        buyerTotalCents: true,
+        deliveries: {
+          orderBy: { createdAt: 'desc' },
+          take: 1,
+          select: {
+            id: true,
+            deliveredConfirmedAt: true,
+            deliveredAsAbsent: true,
+            deliveredAt: true,
+          },
+        },
+      },
+    });
+    if (!order) throw new NotFoundException('Order not found');
+    if (order.buyerId !== buyer.id) {
+      throw new ForbiddenException('Cette commande ne vous appartient pas');
+    }
+    if (order.status === OrderStatus.Pending) {
+      throw new BadRequestException("Cette commande n'a pas encore été payée.");
+    }
+
+    const delivery = order.deliveries[0];
+    const isDelivered =
+      order.status === OrderStatus.Delivered || order.status === OrderStatus.Completed;
+
+    // Claim window: 24h after delivery (only enforced when we have a timestamp).
+    if (isDelivered && delivery?.deliveredAt) {
+      const ageMs = Date.now() - delivery.deliveredAt.getTime();
+      if (ageMs > 24 * 60 * 60 * 1000) {
+        throw new BadRequestException('Le délai de réclamation (24h) est dépassé.');
+      }
+    }
+
+    // Food poisoning needs proof.
+    if (dto.type === 'FOOD_POISONING' && (dto.proofFileUrls?.length ?? 0) === 0) {
+      throw new BadRequestException("Une preuve est requise pour un signalement d'intoxication.");
+    }
+
+    // No duplicate active dispute for the same order + type.
+    const existing = await this.prisma.db.orderDispute.findFirst({
+      where: { orderId, type: dto.type, status: { in: ['OPEN', 'ADMIN_REVIEW'] } },
+      select: { id: true },
+    });
+    if (existing) {
+      throw new ConflictException('Un litige est déjà ouvert pour ce motif.');
+    }
+
+    // Decision logic.
+    let status: DisputeStatus;
+    let autoRefund = false;
+    let sellerStrike = false;
+    let refundApproved = false;
+    let refundAmountCents: number | null = null;
+    let message = 'Votre signalement a bien été enregistré.';
+    const refundRequested = dto.type !== 'SUBJECTIVE_DISSATISFACTION';
+
+    switch (dto.type) {
+      case 'SUBJECTIVE_DISSATISFACTION':
+        status = 'REJECTED';
+        message = 'Votre avis est important, mais ce motif ne donne pas lieu à un remboursement.';
+        this.logger.log(`[Dispute] rejected reason=subjective orderId=${orderId}`);
+        break;
+      case 'NEVER_RECEIVED':
+        if (delivery?.deliveredConfirmedAt || delivery?.deliveredAsAbsent) {
+          status = 'ADMIN_REVIEW';
+          message =
+            'Une preuve de livraison existe : votre réclamation est transmise à notre équipe.';
+          this.logger.log(`[Dispute] admin-review orderId=${orderId}`);
+        } else {
+          status = 'AUTO_REFUNDED';
+          autoRefund = true;
+          refundApproved = true;
+          refundAmountCents = order.buyerTotalCents;
+          message = 'Aucune preuve de livraison : votre commande a été remboursée.';
+        }
+        break;
+      case 'WRONG_ORDER':
+        status = 'AUTO_REFUNDED';
+        autoRefund = true;
+        refundApproved = true;
+        refundAmountCents = order.buyerTotalCents;
+        sellerStrike = true;
+        message = 'Commande erronée : vous avez été remboursé(e).';
+        break;
+      case 'SPOILED_FOOD':
+        status = 'ADMIN_REVIEW';
+        message = 'Signalement transmis à notre équipe (sécurité alimentaire).';
+        this.logger.log(`[Dispute] admin-review orderId=${orderId}`);
+        break;
+      case 'FOOD_POISONING':
+        status = 'ADMIN_REVIEW';
+        message = 'Signalement urgent transmis à notre équipe.';
+        this.logger.log(`[Dispute] admin-review orderId=${orderId}`);
+        break;
+    }
+
+    const now = new Date();
+    const dispute = await this.prisma.db.orderDispute.create({
+      data: {
+        id: generateUlid(),
+        orderId,
+        buyerId: order.buyerId,
+        sellerId: order.sellerId,
+        deliveryId: delivery?.id ?? null,
+        type: dto.type,
+        status,
+        description: dto.description ?? null,
+        photoUrls: (dto.photoUrls ?? undefined) as never,
+        proofFileUrls: (dto.proofFileUrls ?? undefined) as never,
+        refundRequested,
+        refundApproved,
+        refundAmountCents,
+        resolvedAt: status === 'AUTO_REFUNDED' || status === 'REJECTED' ? now : null,
+      },
+    });
+    this.logger.log(`[Dispute] created orderId=${orderId} type=${dto.type} status=${status}`);
+
+    if (autoRefund) {
+      await this.refundForDispute(orderId);
+      this.logger.log(`[Dispute] auto-refund orderId=${orderId}`);
+    }
+
+    if (sellerStrike) {
+      try {
+        await this.strikes.addStrike({
+          userId: order.sellerId,
+          role: 'SELLER',
+          points: 1,
+          reason: 'WRONG_ORDER',
+          severity: 'LIGHT',
+          sourceType: 'ORDER',
+          orderId,
+        });
+      } catch (err) {
+        this.logger.error(
+          `[Dispute] seller strike failed orderId=${orderId}: ${(err as Error).message}`,
+        );
+      }
+    }
+
+    await this.notifyDisputeParties(
+      order.buyerId,
+      order.sellerId,
+      orderId,
+      dto.type,
+      status,
+      message,
+    );
+
+    return { dispute, message };
+  }
+
+  /** Admin: list disputes, optional status/type/search (orderId/buyerId/sellerId/id). */
+  async listDisputes(filters: {
+    status?: string;
+    type?: string;
+    search?: string;
+  }): Promise<OrderDispute[]> {
+    const where: Prisma.OrderDisputeWhereInput = {};
+    if (filters.status) where.status = filters.status;
+    if (filters.type) where.type = filters.type;
+    const search = filters.search?.trim();
+    if (search) {
+      where.OR = [{ id: search }, { orderId: search }, { buyerId: search }, { sellerId: search }];
+    }
+    return this.prisma.db.orderDispute.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      take: 100,
+    });
+  }
+
+  /** Admin: one dispute. */
+  async getDispute(id: string): Promise<OrderDispute> {
+    const dispute = await this.prisma.db.orderDispute.findUnique({ where: { id } });
+    if (!dispute) throw new NotFoundException('Dispute not found');
+    return dispute;
+  }
+
+  /** Admin approves a refund: refunds the order (idempotent) and resolves the dispute. */
+  async adminApproveRefund(id: string, adminId: string, notes?: string): Promise<OrderDispute> {
+    const dispute = await this.getDispute(id);
+    const order = await this.prisma.db.order.findUnique({
+      where: { id: dispute.orderId },
+      select: { buyerTotalCents: true },
+    });
+
+    await this.refundForDispute(dispute.orderId); // idempotent — never refunds twice
+
+    const updated = await this.prisma.db.orderDispute.update({
+      where: { id },
+      data: {
+        status: 'RESOLVED',
+        refundApproved: true,
+        refundAmountCents: dispute.refundAmountCents ?? order?.buyerTotalCents ?? null,
+        adminNotes: notes ?? dispute.adminNotes,
+        resolvedAt: new Date(),
+      },
+    });
+    this.logger.log(`[Dispute] admin-approved refund disputeId=${id} by=${adminId}`);
+    await this.notifyDisputeParties(
+      dispute.buyerId,
+      dispute.sellerId,
+      dispute.orderId,
+      dispute.type,
+      'RESOLVED',
+      'Votre commande a été remboursée après examen.',
+    );
+    return updated;
+  }
+
+  /** Admin rejects a dispute (no refund). */
+  async adminRejectDispute(id: string, adminId: string, notes?: string): Promise<OrderDispute> {
+    const dispute = await this.getDispute(id);
+    const updated = await this.prisma.db.orderDispute.update({
+      where: { id },
+      data: {
+        status: 'REJECTED',
+        adminNotes: notes ?? dispute.adminNotes,
+        resolvedAt: new Date(),
+      },
+    });
+    this.logger.log(`[Dispute] admin-rejected disputeId=${id} by=${adminId}`);
+    await this.notifyDisputeParties(
+      dispute.buyerId,
+      dispute.sellerId,
+      dispute.orderId,
+      dispute.type,
+      'REJECTED',
+      'Votre réclamation a été examinée et n’a pas donné lieu à un remboursement.',
+    );
+    return updated;
+  }
+
+  /** Admin resolves a dispute without a refund (e.g. informational close). */
+  async adminResolveDispute(id: string, adminId: string, notes?: string): Promise<OrderDispute> {
+    const dispute = await this.getDispute(id);
+    const updated = await this.prisma.db.orderDispute.update({
+      where: { id },
+      data: {
+        status: 'RESOLVED',
+        adminNotes: notes ?? dispute.adminNotes,
+        resolvedAt: new Date(),
+      },
+    });
+    this.logger.log(`[Dispute] admin-resolved disputeId=${id} by=${adminId}`);
+    return updated;
+  }
+
+  /** Refunds an order for a dispute (idempotent) and marks it REFUNDED. */
+  private async refundForDispute(orderId: string): Promise<void> {
+    await this.refundOrderIfNeeded(orderId);
+    await this.prisma.db.order.update({
+      where: { id: orderId },
+      data: { status: 'REFUNDED' },
+    });
+    await this.publishOrderStatusChanged(orderId, OrderStatus.Refunded);
+  }
+
+  /** Best-effort dispute notifications to buyer + seller. */
+  private async notifyDisputeParties(
+    buyerId: string,
+    sellerId: string,
+    orderId: string,
+    type: string,
+    status: DisputeStatus,
+    buyerMessage: string,
+  ): Promise<void> {
+    try {
+      await this.notifications.sendToUsers([buyerId], {
+        title: 'Réclamation',
+        body: buyerMessage,
+        data: { type: 'dispute', orderId, disputeType: type, status },
+      });
+      // The seller is informed for claims that concern their order/conduct.
+      if (type !== 'SUBJECTIVE_DISSATISFACTION') {
+        await this.notifications.sendToUsers([sellerId], {
+          title: 'Litige sur une commande',
+          body: 'Un litige a été ouvert sur une de vos commandes.',
+          data: { type: 'dispute_seller', orderId, disputeType: type, status },
+        });
+      }
+    } catch {
+      // best-effort
+    }
   }
 
   /**

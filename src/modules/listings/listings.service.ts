@@ -253,6 +253,15 @@ export class ListingsService {
     if (!listing || listing.deletedAt !== null) {
       throw new NotFoundException('Listing not found');
     }
+    // Hide listings of a suspended seller from buyers (cached/deep-linked detail).
+    const sellerUser = await this.prisma.db.user.findUnique({
+      where: { id: listing.sellerId },
+      select: { isSuspended: true },
+    });
+    if (sellerUser?.isSuspended) {
+      this.logger.warn(`[Strikes] hidden suspended seller listing sellerId=${listing.sellerId}`);
+      throw new NotFoundException('Listing not found');
+    }
     return listing;
   }
 
@@ -404,6 +413,8 @@ export class ListingsService {
       Prisma.sql`sp."subscriptionStatus"::text IN ('ACTIVE', 'TRIALING')`,
       Prisma.sql`(sp."subscriptionCurrentPeriodEnd" IS NULL OR sp."subscriptionCurrentPeriodEnd" > now())`,
       Prisma.sql`u."deletedAt" IS NULL`,
+      // Suspended sellers are hidden from the buyer feed.
+      Prisma.sql`u."isSuspended" = false`,
     ];
 
     if (query.category) {
