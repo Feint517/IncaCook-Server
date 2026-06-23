@@ -230,6 +230,39 @@ export class WalletService {
   }
 
   /**
+   * Records a driver wallet debt (negative AVAILABLE entry) for the refunded
+   * amount when a driver disappears after pickup. Because it's an AVAILABLE
+   * entry, it nets against the driver's available balance: if they have funds
+   * it's deducted now; otherwise the balance goes negative (debt) and cashout
+   * is blocked until future earnings cover it. Idempotent via the
+   * (orderId, userId, type) unique constraint — the platform absorbs whatever
+   * the wallet never recovers. Logged with the positive magnitude.
+   */
+  async recordDriverDebt(orderId: string, driverId: string, amountCents: number): Promise<void> {
+    if (amountCents <= 0) return;
+    const res = await this.prisma.db.walletEntry.createMany({
+      data: [
+        {
+          id: generateUlid(),
+          userId: driverId,
+          orderId,
+          type: WalletEntryType.DRIVER_DEBT,
+          amountCents: -amountCents,
+          status: WalletEntryStatus.AVAILABLE,
+          availableAt: new Date(),
+          metadata: { reason: 'driver_disappeared_refund_deduction' },
+        },
+      ],
+      skipDuplicates: true,
+    });
+    if (res.count > 0) {
+      this.logger.log(
+        `[DriverDebt] created driverId=${driverId} orderId=${orderId} amountCents=${amountCents}`,
+      );
+    }
+  }
+
+  /**
    * Periodic release sweep. Runs in the API process (ScheduleModule is global);
    * a future BullMQ worker can call [releaseDuePendingEntries] instead — the
    * logic is idempotent and process-agnostic.
@@ -335,7 +368,9 @@ export class WalletService {
       select: { id: true },
     });
     if (!user) throw new NotFoundException('User profile not found');
-    const [availableCents, pendingCents, heldCents, paidOutCents, entries] = await Promise.all([
+    const [availableRaw, pendingCents, heldCents, paidOutCents, entries] = await Promise.all([
+      // Net of all AVAILABLE entries — includes negative DRIVER_DEBT rows, so a
+      // driver in debt has a negative raw available balance.
       this.sumByStatus(user.id, WalletEntryStatus.AVAILABLE),
       this.sumByStatus(user.id, WalletEntryStatus.PENDING),
       this.sumByStatus(user.id, WalletEntryStatus.HELD),
@@ -346,15 +381,20 @@ export class WalletService {
         take: 50,
       }),
     ]);
+    const availableCents = Math.max(0, availableRaw);
+    const debtCents = availableRaw < 0 ? -availableRaw : 0;
     return {
       availableCents,
       pendingCents,
       heldCents,
       paidOutCents,
-      // Visible total of money owed to the user (not yet withdrawn).
-      totalBalanceCents: availableCents + pendingCents + heldCents,
+      // Outstanding debt (refund clawback not yet covered by earnings).
+      debtCents,
+      // Visible total of money owed to the user (net of any debt).
+      totalBalanceCents: availableRaw + pendingCents + heldCents,
       minWithdrawalCents: WITHDRAWAL_MIN_CENTS,
-      canWithdraw: availableCents >= WITHDRAWAL_MIN_CENTS,
+      // No cashout while in debt.
+      canWithdraw: debtCents === 0 && availableCents >= WITHDRAWAL_MIN_CENTS,
       entries: entries.map((e) => ({
         id: e.id,
         orderId: e.orderId,
@@ -381,19 +421,36 @@ export class WalletService {
     });
     if (!user) throw new NotFoundException('User profile not found');
 
-    // Threshold check FIRST (clearest error, independent of Connect setup).
+    // All AVAILABLE entries, INCLUDING negative DRIVER_DEBT rows so the net
+    // governs the payout. Settling them all on withdrawal also clears any debt
+    // that the positive earnings cover.
     const available = await this.prisma.db.walletEntry.findMany({
       where: {
         userId: user.id,
         status: WalletEntryStatus.AVAILABLE,
-        amountCents: { gt: 0 },
       },
-      select: { id: true, amountCents: true },
+      select: { id: true, amountCents: true, type: true },
     });
     const total = available.reduce((s, e) => s + e.amountCents, 0);
+    // Debt (net negative) blocks cashout entirely.
+    if (total < 0) {
+      this.logger.warn(`[DriverDebt] cashout blocked driverId=${user.id} debtCents=${-total}`);
+      throw new BadRequestException('Retrait impossible : votre solde présente une dette.');
+    }
     if (total < WITHDRAWAL_MIN_CENTS) {
       throw new BadRequestException(
         `Solde insuffisant pour un retrait (minimum ${(WITHDRAWAL_MIN_CENTS / 100).toFixed(2)} €, disponible ${(total / 100).toFixed(2)} €).`,
+      );
+    }
+
+    // The net is positive but settles negative DRIVER_DEBT rows too: future
+    // earnings have covered the debt, and the surplus is what's paid out.
+    const debtSettled = available
+      .filter((e) => e.amountCents < 0)
+      .reduce((s, e) => s - e.amountCents, 0);
+    if (debtSettled > 0) {
+      this.logger.log(
+        `[DriverDebt] future earning offset debt driverId=${user.id} amountCents=${debtSettled}`,
       );
     }
 
@@ -518,6 +575,7 @@ export interface WalletSummary {
   pendingCents: number;
   heldCents: number;
   paidOutCents: number;
+  debtCents: number;
   totalBalanceCents: number;
   minWithdrawalCents: number;
   canWithdraw: boolean;

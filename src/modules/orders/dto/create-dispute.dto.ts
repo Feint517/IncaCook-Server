@@ -5,7 +5,10 @@ export type DisputeType =
   | 'WRONG_ORDER'
   | 'SPOILED_FOOD'
   | 'FOOD_POISONING'
-  | 'SUBJECTIVE_DISSATISFACTION';
+  | 'SUBJECTIVE_DISSATISFACTION'
+  | 'ALLERGEN_FALSE_DECLARATION'
+  // System-created (Stripe webhook); not buyer-submittable.
+  | 'CHARGEBACK';
 
 export type DisputeStatus = 'OPEN' | 'AUTO_REFUNDED' | 'REJECTED' | 'ADMIN_REVIEW' | 'RESOLVED';
 
@@ -17,6 +20,7 @@ export class CreateDisputeDto {
     'SPOILED_FOOD',
     'FOOD_POISONING',
     'SUBJECTIVE_DISSATISFACTION',
+    'ALLERGEN_FALSE_DECLARATION',
   ])
   type!: DisputeType;
 

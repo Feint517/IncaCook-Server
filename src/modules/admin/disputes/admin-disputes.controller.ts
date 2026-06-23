@@ -75,4 +75,34 @@ export class AdminDisputesController {
   ) {
     return this.orders.adminResolveDispute(id, admin.id, dto.notes);
   }
+
+  /**
+   * `POST /v1/admin/disputes/:id/confirm-allergen` — confirm a false-allergen
+   * declaration: adds a SERIOUS seller strike (auto-suspends at threshold) and
+   * resolves the dispute.
+   */
+  @Post('admin/disputes/:id/confirm-allergen')
+  @HttpCode(HttpStatus.OK)
+  async confirmAllergen(
+    @CurrentUser() admin: AuthenticatedUser,
+    @Param('id') id: string,
+    @Body() dto: DisputeActionDto,
+  ) {
+    return this.orders.adminConfirmAllergenViolation(id, admin.id, dto.notes);
+  }
+
+  /**
+   * `POST /v1/admin/disputes/:id/confirm-chargeback-fraud` — confirm a Stripe
+   * chargeback as fraudulent: adds a SERIOUS buyer strike (auto-suspends at
+   * threshold) and resolves the dispute.
+   */
+  @Post('admin/disputes/:id/confirm-chargeback-fraud')
+  @HttpCode(HttpStatus.OK)
+  async confirmChargebackFraud(
+    @CurrentUser() admin: AuthenticatedUser,
+    @Param('id') id: string,
+    @Body() dto: DisputeActionDto,
+  ) {
+    return this.orders.adminConfirmFraudulentChargeback(id, admin.id, dto.notes);
+  }
 }

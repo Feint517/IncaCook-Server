@@ -91,6 +91,7 @@ describe('OrdersService — buyer disputes', () => {
       {} as never,
       {} as never,
       { addStrike } as never,
+      { enqueue: async () => {} } as never,
     );
     vi.spyOn(service, 'publishOrderStatusChanged').mockImplementation(publish);
   });
@@ -242,5 +243,134 @@ describe('OrdersService — buyer disputes', () => {
     const updated = await service.adminResolveDispute('disp1', 'admin-1', 'handled offline');
     expect(updated.status).toBe('RESOLVED');
     expect(refundsCreate).not.toHaveBeenCalled();
+  });
+
+  // --- Allergen false declaration ----------------------------------------
+
+  it('allergen false declaration → ADMIN_REVIEW, no auto-refund', async () => {
+    const { dispute } = await service.createDispute('sub-buyer', 'o1', {
+      type: 'ALLERGEN_FALSE_DECLARATION',
+      description: 'Contient des arachides, non déclaré.',
+    });
+    expect(dispute.status).toBe('ADMIN_REVIEW');
+    expect(refundsCreate).not.toHaveBeenCalled();
+    expect(addStrike).not.toHaveBeenCalled(); // strike only on admin confirm
+  });
+
+  it('allergen report requires a description', async () => {
+    await expect(
+      service.createDispute('sub-buyer', 'o1', { type: 'ALLERGEN_FALSE_DECLARATION' }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('forbids a non-buyer from filing an allergen report', async () => {
+    userFindUnique.mockResolvedValue({ id: 'other-buyer' });
+    await expect(
+      service.createDispute('sub-other', 'o1', {
+        type: 'ALLERGEN_FALSE_DECLARATION',
+        description: 'x',
+      }),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+  });
+
+  it('admin confirm adds a 2-point SERIOUS seller strike (deduped per order) + resolves', async () => {
+    disputeFindUnique.mockResolvedValue({
+      id: 'disp1',
+      orderId: 'o1',
+      buyerId: 'buyer-1',
+      sellerId: 'seller-1',
+      type: 'ALLERGEN_FALSE_DECLARATION',
+      description: 'arachides non déclarées',
+      adminNotes: null,
+    });
+
+    const updated = await service.adminConfirmAllergenViolation('disp1', 'admin-1', 'confirmé');
+
+    expect(addStrike).toHaveBeenCalledWith(
+      expect.objectContaining({
+        userId: 'seller-1',
+        role: 'SELLER',
+        reason: 'ALLERGEN_FALSE_DECLARATION',
+        severity: 'SERIOUS',
+        points: 2,
+        orderId: 'o1',
+        sourceId: 'disp1',
+      }),
+    );
+    expect(updated.status).toBe('RESOLVED');
+    expect(refundsCreate).not.toHaveBeenCalled();
+  });
+
+  it('admin confirm reflects auto-suspension when the strike threshold is reached', async () => {
+    disputeFindUnique.mockResolvedValue({
+      id: 'disp1',
+      orderId: 'o1',
+      buyerId: 'buyer-1',
+      sellerId: 'seller-1',
+      type: 'ALLERGEN_FALSE_DECLARATION',
+      description: 'x',
+      adminNotes: null,
+    });
+    // StrikesService reports the seller is now suspended (threshold reached).
+    addStrike.mockResolvedValue({ created: true, suspended: true });
+
+    await service.adminConfirmAllergenViolation('disp1', 'admin-1');
+
+    // Seller is notified with the suspension message.
+    expect(sendToUsers).toHaveBeenCalledWith(
+      ['seller-1'],
+      expect.objectContaining({ body: expect.stringContaining('suspendu') }),
+    );
+  });
+
+  // --- Chargeback fraud confirmation -------------------------------------
+
+  it('admin confirm chargeback fraud adds a 2-pt SERIOUS buyer strike (deduped) + resolves', async () => {
+    disputeFindUnique.mockResolvedValue({
+      id: 'disp1',
+      orderId: 'o1',
+      buyerId: 'buyer-1',
+      sellerId: 'seller-1',
+      type: 'CHARGEBACK',
+      stripeDisputeId: 'dp_1',
+      description: 'chargeback',
+      adminNotes: null,
+    });
+
+    const updated = await service.adminConfirmFraudulentChargeback('disp1', 'admin-1', 'fraude');
+
+    expect(addStrike).toHaveBeenCalledWith(
+      expect.objectContaining({
+        userId: 'buyer-1',
+        role: 'BUYER',
+        reason: 'FRAUDULENT_CHARGEBACK',
+        severity: 'SERIOUS',
+        points: 2,
+        orderId: 'o1',
+        sourceId: 'dp_1',
+      }),
+    );
+    expect(updated.status).toBe('RESOLVED');
+    expect(refundsCreate).not.toHaveBeenCalled();
+  });
+
+  it('chargeback fraud confirm reflects buyer auto-suspension at threshold', async () => {
+    disputeFindUnique.mockResolvedValue({
+      id: 'disp1',
+      orderId: 'o1',
+      buyerId: 'buyer-1',
+      sellerId: 'seller-1',
+      type: 'CHARGEBACK',
+      stripeDisputeId: 'dp_1',
+      adminNotes: null,
+    });
+    addStrike.mockResolvedValue({ created: true, suspended: true });
+
+    await service.adminConfirmFraudulentChargeback('disp1', 'admin-1');
+
+    expect(sendToUsers).toHaveBeenCalledWith(
+      ['buyer-1'],
+      expect.objectContaining({ body: expect.stringContaining('suspendu') }),
+    );
   });
 });

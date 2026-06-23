@@ -71,6 +71,7 @@ describe('OrdersService — cancelForSellerUnavailable', () => {
       { compensateDriver } as never,
       {} as never,
       { addStrike } as never,
+      { enqueue: async () => {} } as never,
     );
     vi.spyOn(service, 'publishOrderStatusChanged').mockImplementation(publish);
   });

@@ -876,6 +876,15 @@ export class DeliveriesService {
       // best-effort
     }
 
+    // Realtime: clear the driver's active job (the delivery is now cancelled).
+    await this.orders.publishDeliveryCancelledToDriver(driver.userId, {
+      deliveryId,
+      orderId: delivery.orderId,
+      status: 'CANCELLED',
+      reason: 'seller_unavailable',
+      message: 'Cette livraison a été annulée.',
+    });
+
     return this.loadDelivery(deliveryId);
   }
 

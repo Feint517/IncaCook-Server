@@ -15,7 +15,21 @@ const USER_SELECT = {
   suspendedAt: true,
   suspensionReason: true,
   createdAt: true,
+  // Seller rating aggregates — useful context for rating-based suspensions.
+  sellerProfile: { select: { averageRating: true, reviewCount: true } },
 } satisfies Prisma.UserSelect;
+
+type UserRow = Prisma.UserGetPayload<{ select: typeof USER_SELECT }>;
+
+/** Flattens the seller rating aggregates to top-level fields. */
+function toResponse(u: UserRow) {
+  const { sellerProfile, ...rest } = u;
+  return {
+    ...rest,
+    averageRating: sellerProfile?.averageRating ?? null,
+    reviewCount: sellerProfile?.reviewCount ?? null,
+  };
+}
 
 /**
  * Read-only admin user lookup backing the sanctions UI. No business rules — just
@@ -39,13 +53,14 @@ export class AdminUsersService {
           ],
         }
       : {};
-    return this.prisma.db.user.findMany({
+    const users = await this.prisma.db.user.findMany({
       where,
       select: USER_SELECT,
       orderBy: { createdAt: 'desc' },
       take: limit,
       skip: offset,
     });
+    return users.map(toResponse);
   }
 
   /** Single user (for refreshing the selected user after an action). */
@@ -54,6 +69,6 @@ export class AdminUsersService {
     if (!user) {
       throw new NotFoundException('User not found');
     }
-    return user;
+    return toResponse(user);
   }
 }

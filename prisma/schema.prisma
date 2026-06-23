@@ -1222,6 +1222,7 @@ enum CatalogOrderStatus {
   PAID // seller's card charged
   FAILED // payment failed
   CANCELLED
+  REFUNDED // refunded via an after-sales (SAV) claim
 }
 
 model CatalogProduct {
@@ -1258,6 +1259,8 @@ model CatalogOrder {
 
   // Stripe is the source of truth for PAID (confirm-payment + webhook).
   stripePaymentIntentId String? @unique
+  // Set when an SAV claim is refunded — guards against double refunds.
+  stripeRefundId        String?
 
   createdAt DateTime  @default(now())
   updatedAt DateTime  @updatedAt
@@ -1265,6 +1268,36 @@ model CatalogOrder {
 
   items CatalogOrderItem[]
 
+  @@index([sellerId])
+  @@index([status])
+}
+
+/// After-sales (SAV) claim a seller opens on a kitchen catalog order within
+/// 14 days. Relation-less (String FKs) like OrderDispute — admins resolve
+/// refund / replacement / reject / resolve manually. The partner is
+/// responsible, but the platform may advance the refund first.
+model CatalogClaim {
+  id             String @id
+  catalogOrderId String
+  sellerId       String
+  // NEVER_RECEIVED | DEFECTIVE | WRONG_ITEM
+  type           String
+  // OPEN | ADMIN_REVIEW | REFUNDED | REPLACEMENT_REQUESTED | REJECTED | RESOLVED
+  status         String @default("OPEN")
+
+  description       String
+  photoUrls         Json?
+  adminNotes        String?
+  refundAmountCents Int?
+  replacementNotes  String?
+  // Set when refunded via Stripe — idempotency guard against double refunds.
+  stripeRefundId    String?
+
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+  resolvedAt DateTime?
+
+  @@index([catalogOrderId])
   @@index([sellerId])
   @@index([status])
 }
@@ -1353,6 +1386,7 @@ enum WalletEntryType {
   COMMISSION // platform cut (recorded under userId='PLATFORM')
   REFUND
   WITHDRAWAL // payout debit
+  DRIVER_DEBT // negative: refund clawback when a driver disappears after pickup
 }
 
 enum WalletEntryStatus {
@@ -1408,7 +1442,8 @@ model OrderDispute {
   buyerId    String
   sellerId   String
   deliveryId String?
-  // NEVER_RECEIVED | WRONG_ORDER | SPOILED_FOOD | FOOD_POISONING | SUBJECTIVE_DISSATISFACTION
+  // NEVER_RECEIVED | WRONG_ORDER | SPOILED_FOOD | FOOD_POISONING |
+  // SUBJECTIVE_DISSATISFACTION | ALLERGEN_FALSE_DECLARATION | CHARGEBACK
   type       String
   // OPEN | AUTO_REFUNDED | REJECTED | ADMIN_REVIEW | RESOLVED
   status     String
@@ -1420,6 +1455,12 @@ model OrderDispute {
   refundApproved  Boolean @default(false)
   refundAmountCents Int?
   adminNotes      String?
+
+  // Stripe payment dispute (chargeback) link + payload. Unique so the webhook
+  // is idempotent per Stripe dispute. metadata holds amount/currency/reason/
+  // stripeStatus/evidenceDueBy.
+  stripeDisputeId String? @unique
+  metadata        Json?
 
   createdAt  DateTime  @default(now())
   updatedAt  DateTime  @updatedAt

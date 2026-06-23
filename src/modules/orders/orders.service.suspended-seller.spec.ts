@@ -47,6 +47,7 @@ describe('OrdersService — block orders from suspended sellers', () => {
       {} as never,
       {} as never,
       {} as never,
+      { enqueue: async () => {} } as never,
     );
   });
 

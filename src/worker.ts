@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
+import { ScheduleModule } from '@nestjs/schedule';
 import { Logger as PinoLogger } from 'nestjs-pino';
 
 import 'reflect-metadata';
@@ -11,6 +12,7 @@ import { DatabaseModule } from '@infrastructure/database/database.module';
 import { LoggerModule } from '@infrastructure/logger/logger.module';
 import { QueueModule } from '@infrastructure/queue/queue.module';
 import { RedisModule } from '@infrastructure/redis/redis.module';
+import { StripeModule } from '@infrastructure/stripe/stripe.module';
 import { SupabaseModule } from '@infrastructure/supabase/supabase.module';
 
 import { JobsModule } from '@jobs/jobs.module';
@@ -24,6 +26,10 @@ import { JobsModule } from '@jobs/jobs.module';
     QueueModule,
     SupabaseModule,
     AuditModule,
+    // OrdersService (pulled in by JobsModule) injects SchedulerRegistry +
+    // StripeService; both must be available in the worker's DI graph.
+    ScheduleModule.forRoot(),
+    StripeModule,
     JobsModule,
   ],
 })

@@ -75,6 +75,7 @@ describe('OrdersService — no-driver fallback', () => {
       {} as never,
       scheduler,
       {} as never,
+      { enqueue: async () => {} } as never,
     );
     // publishOrderStatusChanged uses redis; stub it to avoid the null redis dep.
     vi.spyOn(service, 'publishOrderStatusChanged').mockImplementation(publish);

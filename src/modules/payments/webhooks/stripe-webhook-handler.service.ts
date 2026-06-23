@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 
 import { OrderStatus } from '@common/enums/order-status.enum';
 import { UserRole } from '@common/enums/user-role.enum';
+import { generateUlid } from '@common/utils/code-generator.util';
 
 import { PrismaService } from '@infrastructure/database/prisma.service';
 import { RedisService } from '@infrastructure/redis/redis.service';
@@ -69,6 +70,13 @@ export class StripeWebhookHandlerService {
         return;
       case 'invoice.payment_failed':
         await this.handleInvoicePaymentFailed(event.data.object as Stripe.Invoice);
+        return;
+
+      // ---- Chargebacks / payment disputes ----
+      case 'charge.dispute.created':
+      case 'charge.dispute.updated':
+      case 'charge.dispute.closed':
+        await this.handleChargeDispute(event.data.object as Stripe.Dispute);
         return;
 
       default:
@@ -310,6 +318,93 @@ export class StripeWebhookHandlerService {
       });
     });
     await this.publishStatus(order.id, OrderStatus.Cancelled);
+  }
+
+  // ---------------------------------------------------------------------
+  // Chargebacks / payment disputes (charge.dispute.*)
+  // ---------------------------------------------------------------------
+
+  /**
+   * Records a Stripe chargeback as an OrderDispute (type CHARGEBACK,
+   * ADMIN_REVIEW) so it's visible to admins. NO automatic refund/strike — the
+   * dispute is external; an admin confirms fraud later. Idempotent per Stripe
+   * dispute id: a re-delivered or updated/closed event refreshes the payload.
+   */
+  private async handleChargeDispute(dispute: Stripe.Dispute): Promise<void> {
+    const order = await this.findOrderForDispute(dispute);
+    if (!order) {
+      this.logger.warn(`[Chargeback] no matching order for stripeDisputeId=${dispute.id}`);
+      return;
+    }
+
+    const dueBy = dispute.evidence_details?.due_by;
+    const metadata = {
+      stripeDisputeId: dispute.id,
+      amount: dispute.amount,
+      currency: dispute.currency,
+      reason: dispute.reason,
+      stripeStatus: dispute.status,
+      evidenceDueBy: dueBy ? new Date(dueBy * 1000).toISOString() : null,
+    };
+
+    const existing = await this.prisma.db.orderDispute.findUnique({
+      where: { stripeDisputeId: dispute.id },
+      select: { id: true },
+    });
+    if (existing) {
+      // updated/closed (or a re-delivered created) — refresh the Stripe payload
+      // only; never override an admin's resolution of the dispute.
+      await this.prisma.db.orderDispute.update({
+        where: { id: existing.id },
+        data: { metadata },
+      });
+      this.logger.log(
+        `[Chargeback] updated orderId=${order.id} stripeDisputeId=${dispute.id} status=${dispute.status}`,
+      );
+      return;
+    }
+
+    await this.prisma.db.orderDispute.create({
+      data: {
+        id: generateUlid(),
+        orderId: order.id,
+        buyerId: order.buyerId,
+        sellerId: order.sellerId,
+        type: 'CHARGEBACK',
+        status: 'ADMIN_REVIEW',
+        description: `Chargeback Stripe (${dispute.reason})`,
+        refundRequested: false,
+        stripeDisputeId: dispute.id,
+        metadata,
+      },
+    });
+    this.logger.log(`[Chargeback] received orderId=${order.id} stripeDisputeId=${dispute.id}`);
+  }
+
+  /** Resolves the order a Stripe dispute belongs to via paymentIntent → metadata. */
+  private async findOrderForDispute(
+    dispute: Stripe.Dispute,
+  ): Promise<{ id: string; buyerId: string; sellerId: string } | null> {
+    const piId =
+      typeof dispute.payment_intent === 'string'
+        ? dispute.payment_intent
+        : dispute.payment_intent?.id;
+    if (piId) {
+      const byPi = await this.prisma.db.order.findUnique({
+        where: { stripePaymentIntentId: piId },
+        select: { id: true, buyerId: true, sellerId: true },
+      });
+      if (byPi) return byPi;
+    }
+    const metaOrderId = dispute.metadata?.orderId;
+    if (metaOrderId) {
+      const byMeta = await this.prisma.db.order.findUnique({
+        where: { id: metaOrderId },
+        select: { id: true, buyerId: true, sellerId: true },
+      });
+      if (byMeta) return byMeta;
+    }
+    return null;
   }
 
   private async findOrderForPaymentIntent(pi: Stripe.PaymentIntent): Promise<{

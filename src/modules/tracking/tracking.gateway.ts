@@ -44,12 +44,21 @@ const CONV_PATTERN = 'conv:*:msg';
 const CONV_PREFIX = 'conv:';
 const CONV_SUFFIX = ':msg';
 
+// Per-user delivery events (e.g. a cancelled/failed assigned delivery). Keyed
+// by the recipient User.id and fanned out to their `user:<id>` room — the
+// socket auto-joins this room on connect, so no explicit subscribe is needed.
+const USER_PATTERN = 'user:*:delivery';
+const USER_PREFIX = 'user:';
+const USER_SUFFIX = ':delivery';
+
 export const driverLocChannel = (deliveryId: string): string =>
   `${LOC_PREFIX}${deliveryId}${LOC_SUFFIX}`;
 export const orderStatusChannel = (orderId: string): string =>
   `${STATUS_PREFIX}${orderId}${STATUS_SUFFIX}`;
 export const conversationChannel = (conversationId: string): string =>
   `${CONV_PREFIX}${conversationId}${CONV_SUFFIX}`;
+export const userDeliveryChannel = (userId: string): string =>
+  `${USER_PREFIX}${userId}${USER_SUFFIX}`;
 
 interface SocketData {
   user?: AuthenticatedUser;
@@ -90,6 +99,7 @@ export class TrackingGateway
     await this.subscriber.psubscribe(LOC_PATTERN);
     await this.subscriber.psubscribe(STATUS_PATTERN);
     await this.subscriber.psubscribe(CONV_PATTERN);
+    await this.subscriber.psubscribe(USER_PATTERN);
     this.subscriber.on('pmessage', (_pattern, channel, message) => {
       try {
         if (channel.startsWith(LOC_PREFIX) && channel.endsWith(LOC_SUFFIX)) {
@@ -101,6 +111,9 @@ export class TrackingGateway
             channel.length - STATUS_SUFFIX.length,
           );
           this.server.to(`order:${orderId}`).emit('order:status', JSON.parse(message));
+        } else if (channel.startsWith(USER_PREFIX) && channel.endsWith(USER_SUFFIX)) {
+          const userId = channel.slice(USER_PREFIX.length, channel.length - USER_SUFFIX.length);
+          this.server.to(`user:${userId}`).emit('delivery:cancelled', JSON.parse(message));
         } else if (channel.startsWith(CONV_PREFIX) && channel.endsWith(CONV_SUFFIX)) {
           const conversationId = channel.slice(
             CONV_PREFIX.length,
@@ -113,7 +126,7 @@ export class TrackingGateway
       }
     });
     this.logger.log(
-      `TrackingGateway subscribed to Redis patterns ${LOC_PATTERN}, ${STATUS_PATTERN}, ${CONV_PATTERN}`,
+      `TrackingGateway subscribed to Redis patterns ${LOC_PATTERN}, ${STATUS_PATTERN}, ${CONV_PATTERN}, ${USER_PATTERN}`,
     );
   }
 
@@ -122,6 +135,7 @@ export class TrackingGateway
       await this.subscriber?.punsubscribe(LOC_PATTERN);
       await this.subscriber?.punsubscribe(STATUS_PATTERN);
       await this.subscriber?.punsubscribe(CONV_PATTERN);
+      await this.subscriber?.punsubscribe(USER_PATTERN);
       await this.subscriber?.quit();
     } catch {
       /* shutdown best-effort */
@@ -139,6 +153,16 @@ export class TrackingGateway
     try {
       const user = await this.ws.verify(token);
       (socket.data as SocketData).user = user;
+      // Join the per-user room so targeted events (e.g. delivery:cancelled for
+      // the assigned driver) reach this socket without an explicit subscribe.
+      const internal = await this.prisma.db.user.findUnique({
+        where: { supabaseId: user.id },
+        select: { id: true },
+      });
+      if (internal) {
+        (socket.data as SocketData).internalUserId = internal.id;
+        await socket.join(`user:${internal.id}`);
+      }
       this.logger.debug(`socket ${socket.id} connected (user=${user.id})`);
     } catch (err) {
       this.logger.warn(`socket ${socket.id} auth failed: ${(err as Error).message}`);

@@ -23,6 +23,12 @@ import {
 
 import { AuditService } from '@infrastructure/audit/audit.service';
 import { PrismaService } from '@infrastructure/database/prisma.service';
+import {
+  OrderTimerJobData,
+  QueueNames,
+  TimerJobNames,
+} from '@infrastructure/queue/queue.constants';
+import { QueueService } from '@infrastructure/queue/queue.service';
 import { RedisService } from '@infrastructure/redis/redis.service';
 import { StripeService } from '@infrastructure/stripe/stripe.service';
 
@@ -85,7 +91,36 @@ export class OrdersService {
     private readonly wallet: WalletService,
     private readonly scheduler: SchedulerRegistry,
     private readonly strikes: StrikesService,
+    private readonly queue: QueueService,
   ) {}
+
+  /**
+   * Durable mirror of an in-process watchdog: enqueues a BullMQ delayed job
+   * (processed by the worker) so the timer survives an API restart. Best-effort
+   * — if Redis/enqueue fails, the in-process `setTimeout` remains the fallback,
+   * and double-firing is safe because every handler is idempotent. A stable
+   * `jobId` keeps re-arming from creating duplicate jobs.
+   */
+  private async enqueueTimerJob(
+    jobName: string,
+    data: OrderTimerJobData,
+    delayMs: number,
+    jobId: string,
+  ): Promise<void> {
+    try {
+      await this.queue.enqueue(QueueNames.OrderTimeout, jobName, data, {
+        delay: delayMs,
+        jobId,
+        removeOnComplete: true,
+        removeOnFail: 100,
+      });
+      this.logger.log(`[Jobs] scheduled name=${jobName} id=${jobId} delayMs=${delayMs}`);
+    } catch (err) {
+      this.logger.warn(
+        `[Jobs] fallback in-process timer scheduled name=${jobName} (enqueue failed: ${(err as Error).message})`,
+      );
+    }
+  }
 
   /**
    * Best-effort fanout of an order's new status to anyone subscribed to
@@ -106,6 +141,37 @@ export class OrdersService {
       await this.redis.client.publish(channel, payload);
     } catch (err) {
       this.logger.warn(`status publish failed for ${orderId}: ${(err as Error).message}`);
+    }
+  }
+
+  /**
+   * Realtime push to the assigned driver's per-user room when their delivery is
+   * cancelled/failed server-side, so the driver app auto-clears the active job.
+   * Best-effort — backend guards still reject actions on a cancelled delivery if
+   * the event is missed.
+   */
+  async publishDeliveryCancelledToDriver(
+    driverId: string,
+    payload: {
+      deliveryId: string;
+      orderId: string;
+      status: string;
+      reason: string;
+      message: string;
+    },
+  ): Promise<void> {
+    try {
+      await this.redis.client.publish(
+        `user:${driverId}:delivery`,
+        JSON.stringify({ event: 'delivery:cancelled', ...payload, at: new Date().toISOString() }),
+      );
+      this.logger.log(
+        `[DeliveryRealtime] cancelled event sent deliveryId=${payload.deliveryId} driverId=${driverId}`,
+      );
+    } catch (err) {
+      this.logger.warn(
+        `[DeliveryRealtime] publish failed deliveryId=${payload.deliveryId}: ${(err as Error).message}`,
+      );
     }
   }
 
@@ -820,6 +886,13 @@ export class OrdersService {
     this.logger.log(
       `[NoDriverTimeout] scheduled orderId=${orderId} deliveryId=${deliveryId} in=${NO_DRIVER_TIMEOUT_MINUTES}min`,
     );
+    // Durable backstop (survives restart): processed by the worker.
+    void this.enqueueTimerJob(
+      TimerJobNames.NoDriverTimeout,
+      { orderId },
+      NO_DRIVER_TIMEOUT_MINUTES * 60_000,
+      `${TimerJobNames.NoDriverTimeout}:${orderId}`,
+    );
   }
 
   /** Arms the buyer-response watchdog once the no-driver prompt is shown. */
@@ -835,6 +908,12 @@ export class OrdersService {
       );
     }, NO_DRIVER_BUYER_RESPONSE_MINUTES * 60_000);
     this.scheduler.addTimeout(key, timer);
+    void this.enqueueTimerJob(
+      TimerJobNames.NoDriverBuyerResponseTimeout,
+      { orderId },
+      NO_DRIVER_BUYER_RESPONSE_MINUTES * 60_000,
+      `${TimerJobNames.NoDriverBuyerResponseTimeout}:${orderId}`,
+    );
   }
 
   /**
@@ -1332,6 +1411,17 @@ export class OrdersService {
       // best-effort
     }
 
+    // Realtime: auto-clear the assigned driver's active job (if any).
+    if (delivery?.driverId) {
+      await this.publishDeliveryCancelledToDriver(delivery.driverId, {
+        deliveryId: delivery.id,
+        orderId,
+        status: 'CANCELLED',
+        reason: 'seller_cannot_provide',
+        message: 'La commande a été annulée par le vendeur.',
+      });
+    }
+
     return this.findOrderWithRelations(orderId);
   }
 
@@ -1359,6 +1449,12 @@ export class OrdersService {
     this.scheduler.addTimeout(key, timer);
     this.logger.log(
       `[DriverDisappeared] scheduled deliveryId=${deliveryId} orderId=${orderId} in=${DRIVER_DELIVERY_TIMEOUT_MINUTES}min`,
+    );
+    void this.enqueueTimerJob(
+      TimerJobNames.DriverDeliveryTimeout,
+      { deliveryId },
+      DRIVER_DELIVERY_TIMEOUT_MINUTES * 60_000,
+      `${TimerJobNames.DriverDeliveryTimeout}:${deliveryId}`,
     );
   }
 
@@ -1416,6 +1512,7 @@ export class OrdersService {
         buyerId: true,
         sellerId: true,
         sellerEarningsCents: true,
+        buyerTotalCents: true,
       },
     });
     if (!order) {
@@ -1442,6 +1539,7 @@ export class OrdersService {
       order.buyerId,
       order.sellerId,
       order.sellerEarningsCents,
+      order.buyerTotalCents,
     );
   }
 
@@ -1452,6 +1550,7 @@ export class OrdersService {
     buyerId: string,
     sellerId: string,
     sellerEarningsCents: number,
+    buyerTotalCents: number,
   ): Promise<void> {
     // Delivery FAILED + order CANCELLED. Inventory is NOT restored — the dish
     // already left the seller.
@@ -1496,6 +1595,20 @@ export class OrdersService {
       this.logger.log(`[DriverDisappeared] seller paid orderId=${orderId}`);
     }
 
+    // Clawback: the buyer's refund is deducted from the driver's wallet. This is
+    // a negative AVAILABLE entry, so it nets against any balance and goes into
+    // debt (blocking cashout) when the wallet can't cover it. The platform
+    // absorbs whatever future earnings never recover. Best-effort.
+    if (driverId && buyerTotalCents > 0) {
+      try {
+        await this.wallet.recordDriverDebt(orderId, driverId, buyerTotalCents);
+      } catch (err) {
+        this.logger.error(
+          `[DriverDebt] record failed driverId=${driverId} orderId=${orderId}: ${(err as Error).message}`,
+        );
+      }
+    }
+
     // Driver penalty: critical infraction → immediate exclusion. Best-effort —
     // a strike failure must not break the refund/seller-pay.
     if (driverId) {
@@ -1529,6 +1642,14 @@ export class OrdersService {
         title: 'Incident de livraison',
         body: 'Incident de livraison enregistré.',
         data: { type: 'driver_disappeared', orderId },
+      });
+      // Realtime: clear the (vanished) driver's active job if their app is open.
+      await this.publishDeliveryCancelledToDriver(driverId, {
+        deliveryId,
+        orderId,
+        status: 'FAILED',
+        reason: 'driver_disappeared',
+        message: 'Cette livraison a été annulée.',
       });
     }
   }
@@ -2370,6 +2491,10 @@ export class OrdersService {
     if (dto.type === 'FOOD_POISONING' && (dto.proofFileUrls?.length ?? 0) === 0) {
       throw new BadRequestException("Une preuve est requise pour un signalement d'intoxication.");
     }
+    // Allergen false declaration needs a description (serious safety report).
+    if (dto.type === 'ALLERGEN_FALSE_DECLARATION' && !dto.description?.trim()) {
+      throw new BadRequestException('Une description est requise pour ce signalement.');
+    }
 
     // No duplicate active dispute for the same order + type.
     const existing = await this.prisma.db.orderDispute.findFirst({
@@ -2387,7 +2512,10 @@ export class OrdersService {
     let refundApproved = false;
     let refundAmountCents: number | null = null;
     let message = 'Votre signalement a bien été enregistré.';
-    const refundRequested = dto.type !== 'SUBJECTIVE_DISSATISFACTION';
+    // Allergen reports + subjective dissatisfaction don't request a refund.
+    const refundRequested = !['SUBJECTIVE_DISSATISFACTION', 'ALLERGEN_FALSE_DECLARATION'].includes(
+      dto.type,
+    );
 
     switch (dto.type) {
       case 'SUBJECTIVE_DISSATISFACTION':
@@ -2427,6 +2555,14 @@ export class OrdersService {
         message = 'Signalement urgent transmis à notre équipe.';
         this.logger.log(`[Dispute] admin-review orderId=${orderId}`);
         break;
+      case 'ALLERGEN_FALSE_DECLARATION':
+        status = 'ADMIN_REVIEW';
+        message = 'Signalement allergène transmis à notre équipe (sécurité alimentaire).';
+        this.logger.log(`[Dispute] admin-review reason=allergen orderId=${orderId}`);
+        break;
+      default:
+        // CHARGEBACK is system-created via the Stripe webhook, never here.
+        throw new BadRequestException('Type de litige non pris en charge.');
     }
 
     const now = new Date();
@@ -2579,6 +2715,128 @@ export class OrdersService {
       },
     });
     this.logger.log(`[Dispute] admin-resolved disputeId=${id} by=${adminId}`);
+    return updated;
+  }
+
+  /**
+   * Admin confirms a false-allergen-declaration report: adds a SERIOUS (2-point)
+   * seller strike via the existing StrikesService (which auto-suspends at the
+   * 90-day threshold) and resolves the dispute. Idempotent — the strike is
+   * deduped per order, so a repeated confirm never double-strikes.
+   */
+  async adminConfirmAllergenViolation(
+    id: string,
+    adminId: string,
+    notes?: string,
+  ): Promise<OrderDispute> {
+    const dispute = await this.getDispute(id);
+
+    let suspended = false;
+    try {
+      const res = await this.strikes.addStrike({
+        userId: dispute.sellerId,
+        role: 'SELLER',
+        points: 2,
+        reason: 'ALLERGEN_FALSE_DECLARATION',
+        severity: 'SERIOUS',
+        sourceType: 'ORDER',
+        orderId: dispute.orderId,
+        sourceId: dispute.id,
+        notes: notes ?? dispute.description ?? undefined,
+      });
+      suspended = res.suspended;
+    } catch (err) {
+      this.logger.error(
+        `[Dispute] allergen strike failed disputeId=${id}: ${(err as Error).message}`,
+      );
+    }
+
+    const updated = await this.prisma.db.orderDispute.update({
+      where: { id },
+      data: {
+        status: 'RESOLVED',
+        adminNotes: notes ?? dispute.adminNotes,
+        resolvedAt: new Date(),
+      },
+    });
+    this.logger.log(`[Dispute] admin-confirmed allergen disputeId=${id} by=${adminId}`);
+
+    // Notify seller of the serious strike (best-effort) + buyer of the outcome.
+    try {
+      await this.notifications.sendToUsers([dispute.sellerId], {
+        title: 'Infraction allergène confirmée',
+        body: suspended
+          ? 'Un strike grave a été ajouté. Votre compte est suspendu.'
+          : 'Un strike grave a été ajouté à votre compte (déclaration d’allergènes).',
+        data: { type: 'allergen_strike', orderId: dispute.orderId },
+      });
+      await this.notifications.sendToUsers([dispute.buyerId], {
+        title: 'Signalement traité',
+        body: 'Merci. Votre signalement allergène a été examiné et confirmé.',
+        data: { type: 'dispute', orderId: dispute.orderId, status: 'RESOLVED' },
+      });
+    } catch {
+      // best-effort
+    }
+    return updated;
+  }
+
+  /**
+   * Admin confirms a chargeback was fraudulent: adds a SERIOUS (2-point) BUYER
+   * strike via the existing StrikesService (which auto-suspends at the 90-day
+   * threshold) and resolves the dispute. Idempotent — the strike is deduped per
+   * Stripe dispute / order, so a repeated confirm never double-strikes.
+   */
+  async adminConfirmFraudulentChargeback(
+    id: string,
+    adminId: string,
+    notes?: string,
+  ): Promise<OrderDispute> {
+    const dispute = await this.getDispute(id);
+
+    let suspended = false;
+    try {
+      const res = await this.strikes.addStrike({
+        userId: dispute.buyerId,
+        role: 'BUYER',
+        points: 2,
+        reason: 'FRAUDULENT_CHARGEBACK',
+        severity: 'SERIOUS',
+        sourceType: 'ORDER',
+        orderId: dispute.orderId,
+        sourceId: dispute.stripeDisputeId ?? dispute.id,
+        notes: notes ?? dispute.description ?? undefined,
+      });
+      suspended = res.suspended;
+    } catch (err) {
+      this.logger.error(
+        `[Chargeback] fraud strike failed disputeId=${id}: ${(err as Error).message}`,
+      );
+    }
+
+    const updated = await this.prisma.db.orderDispute.update({
+      where: { id },
+      data: {
+        status: 'RESOLVED',
+        adminNotes: notes ?? dispute.adminNotes,
+        resolvedAt: new Date(),
+      },
+    });
+    this.logger.log(
+      `[Chargeback] fraudulent confirmed buyerId=${dispute.buyerId} orderId=${dispute.orderId} by=${adminId}`,
+    );
+
+    try {
+      await this.notifications.sendToUsers([dispute.buyerId], {
+        title: 'Litige de paiement',
+        body: suspended
+          ? 'Un strike grave a été ajouté. Votre compte est suspendu.'
+          : 'Un strike grave a été ajouté à votre compte (rétrofacturation frauduleuse).',
+        data: { type: 'chargeback_fraud', orderId: dispute.orderId },
+      });
+    } catch {
+      // best-effort
+    }
     return updated;
   }
 

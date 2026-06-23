@@ -15,7 +15,9 @@ import { UserRole } from '@common/enums/user-role.enum';
 import { RolesGuard } from '@common/guards/roles.guard';
 import type { AuthenticatedUser } from '@common/types/authenticated-request.type';
 
+import { CatalogClaimsService } from './catalog-claims.service';
 import { CatalogService } from './catalog.service';
+import { CatalogClaimResponseDto, CreateCatalogClaimDto } from './dto/catalog-claim.dto';
 import {
   CatalogCheckoutResponseDto,
   CatalogOrderResponseDto,
@@ -32,7 +34,10 @@ import { CatalogProductResponseDto } from './dto/catalog-product.dto';
 @UseGuards(RolesGuard)
 @Roles(UserRole.Seller)
 export class CatalogController {
-  constructor(private readonly catalog: CatalogService) {}
+  constructor(
+    private readonly catalog: CatalogService,
+    private readonly claims: CatalogClaimsService,
+  ) {}
 
   /** Browse active products. */
   @Get('products')
@@ -71,5 +76,23 @@ export class CatalogController {
   async myOrders(@CurrentUser() jwtUser: AuthenticatedUser): Promise<CatalogOrderResponseDto[]> {
     const orders = await this.catalog.listMyOrders(jwtUser.id);
     return orders.map(CatalogOrderResponseDto.from);
+  }
+
+  /** Open an after-sales (SAV) claim on a catalog order (within 14 days). */
+  @Post('orders/:orderId/claims')
+  @HttpCode(HttpStatus.CREATED)
+  async createClaim(
+    @CurrentUser() jwtUser: AuthenticatedUser,
+    @Param('orderId') orderId: string,
+    @Body() dto: CreateCatalogClaimDto,
+  ): Promise<CatalogClaimResponseDto> {
+    return CatalogClaimResponseDto.from(await this.claims.createClaim(jwtUser.id, orderId, dto));
+  }
+
+  /** The seller's own SAV claims (for status display in the app). */
+  @Get('claims')
+  async myClaims(@CurrentUser() jwtUser: AuthenticatedUser): Promise<CatalogClaimResponseDto[]> {
+    const claims = await this.claims.listMyClaims(jwtUser.id);
+    return claims.map(CatalogClaimResponseDto.from);
   }
 }

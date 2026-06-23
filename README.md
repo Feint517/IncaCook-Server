@@ -68,7 +68,9 @@ Once running, hit `http://localhost:3000/v1/health`.
 | `pnpm stop:services` | Stop local Redis, Mailhog, and Supabase containers |
 | `pnpm start:dev` | Hot-reloading dev server |
 | `pnpm start:debug` | Dev server with `--inspect` |
+| `pnpm start:prod` | Run compiled API (`node dist/main.js`) |
 | `pnpm start:worker:dev` | BullMQ worker process (dev) |
+| `pnpm start:worker` | Run compiled worker (`node dist/worker.js`) — durable timers |
 | `pnpm build` | Compile to `dist/` |
 | `pnpm lint` / `pnpm lint:check` | ESLint (autofix / check-only) |
 | `pnpm format` / `pnpm format:check` | Prettier |
@@ -77,6 +79,45 @@ Once running, hit `http://localhost:3000/v1/health`.
 | `pnpm test:e2e` | Vitest end-to-end tests |
 | `pnpm prisma:migrate:dev` | Apply migration locally |
 | `pnpm prisma:studio` | Inspect DB |
+
+---
+
+## Durable business timers (BullMQ worker)
+
+Several business rules are time-delayed. Each is armed as an **in-process timer**
+(survives only while the process runs) **and** mirrored as a **durable BullMQ
+job** (survives an API restart). Run the **worker** to process them:
+
+```bash
+pnpm start:worker        # production (node dist/worker.js)
+pnpm start:worker:dev    # dev (watch)
+```
+
+In production run the API **and** the worker. In dev you can run only the API —
+durable jobs queue until a worker runs, and the in-process timers cover the
+no-restart case.
+
+| Timer | Durable BullMQ job | Idempotent handler |
+|---|---|---|
+| No driver after `NO_DRIVER_TIMEOUT_MINUTES` (default 15) | `no_driver_timeout` | `OrdersService.handleNoDriverTimeout` |
+| Buyer no-response after `NO_DRIVER_BUYER_RESPONSE_MINUTES` (default 10) | `no_driver_buyer_response_timeout` | `OrdersService.autoCancelNoResponse` |
+| Driver disappeared after `DRIVER_DELIVERY_TIMEOUT_MINUTES` (default 60) | `driver_delivery_timeout` | `OrdersService.handleDriverDeliveryTimeout` |
+| Wallet pending release (`WALLET_RELEASE_HOURS`, default 24) | `wallet_release_sweep` (repeatable, 5 min) | `WalletService.releaseDuePendingEntries` |
+
+- Processors (`src/jobs/*.processor.ts`) only call the existing idempotent
+  service methods — **no business logic is duplicated**.
+- The in-process timer and the BullMQ job may both fire; this is safe (no double
+  refund / cancel / pay / strike).
+- If Redis is down, the API still starts; enqueue failures log
+  `[Jobs] fallback in-process timer scheduled …` and the in-process timer is the
+  fallback.
+- Job lifecycle logs: `[Jobs] scheduled|processing|completed|failed name=… id=…`.
+
+**Required Redis env** (already used by BullMQ + pub/sub):
+
+```bash
+REDIS_URL=redis://localhost:6379    # or REDIS_HOST / REDIS_PORT / REDIS_PASSWORD
+```
 
 ---
 

@@ -85,6 +85,7 @@ describe('OrdersService — seller cannot provide', () => {
       {} as never,
       {} as never,
       { addStrike } as never,
+      { enqueue: async () => {} } as never,
     );
     vi.spyOn(service, 'publishOrderStatusChanged').mockImplementation(publish);
   });
@@ -167,5 +168,34 @@ describe('OrdersService — seller cannot provide', () => {
     await expect(service.sellerCannotProvide('sub-seller', 'o1', {})).rejects.toBeInstanceOf(
       BadRequestException,
     );
+  });
+
+  it('sends a realtime cancel event to the assigned driver', async () => {
+    const cancelEvent = vi.spyOn(service, 'publishDeliveryCancelledToDriver').mockResolvedValue();
+
+    await service.sellerCannotProvide('sub-seller', 'o1', {});
+
+    expect(cancelEvent).toHaveBeenCalledWith(
+      'driver-1',
+      expect.objectContaining({
+        deliveryId: 'd1',
+        orderId: 'o1',
+        status: 'CANCELLED',
+        reason: 'seller_cannot_provide',
+      }),
+    );
+  });
+
+  it('sends no realtime event when no driver is assigned', async () => {
+    orderFindUnique.mockResolvedValue(
+      order({
+        deliveries: [{ id: 'd1', status: 'SEARCHING', pickupConfirmedAt: null, driverId: null }],
+      }),
+    );
+    const cancelEvent = vi.spyOn(service, 'publishDeliveryCancelledToDriver').mockResolvedValue();
+
+    await service.sellerCannotProvide('sub-seller', 'o1', {});
+
+    expect(cancelEvent).not.toHaveBeenCalled();
   });
 });

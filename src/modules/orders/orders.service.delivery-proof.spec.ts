@@ -33,6 +33,7 @@ describe('OrdersService — delivery proof', () => {
       {} as never,
       {} as never,
       {} as never,
+      { enqueue: async () => {} } as never,
     );
   });
 

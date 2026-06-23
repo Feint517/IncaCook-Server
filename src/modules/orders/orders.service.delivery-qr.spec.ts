@@ -36,6 +36,7 @@ describe('OrdersService — buyer delivery QR', () => {
       {} as never,
       {} as never,
       {} as never,
+      { enqueue: async () => {} } as never,
     );
   });
 

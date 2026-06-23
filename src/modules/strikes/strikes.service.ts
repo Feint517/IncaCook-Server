@@ -125,8 +125,18 @@ export class StrikesService {
     return false;
   }
 
-  /** Flags the account suspended (idempotent). Best-effort push to the user. */
-  async suspendUser(userId: string, role: ActorRole, reason: string): Promise<void> {
+  /**
+   * Flags the account suspended (idempotent). Best-effort push to the user.
+   * Pass [opts.message] to override the default push body (e.g. a
+   * rating-based suspension reason). The push fires only on the transition to
+   * suspended, so callers don't double-notify an already-suspended user.
+   */
+  async suspendUser(
+    userId: string,
+    role: ActorRole,
+    reason: string,
+    opts?: { message?: string },
+  ): Promise<void> {
     const res = await this.prisma.db.user.updateMany({
       where: { id: userId, isSuspended: false },
       data: { isSuspended: true, suspendedAt: new Date(), suspensionReason: reason },
@@ -136,7 +146,7 @@ export class StrikesService {
       try {
         await this.notifications.sendToUsers([userId], {
           title: 'Compte suspendu',
-          body: 'Votre compte a été suspendu suite à des incidents répétés.',
+          body: opts?.message ?? 'Votre compte a été suspendu suite à des incidents répétés.',
           data: { type: 'account_suspended', role },
         });
       } catch {

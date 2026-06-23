@@ -23,6 +23,7 @@ describe('OrdersService — driver disappeared after pickup', () => {
   let refundsCreate: ReturnType<typeof vi.fn>;
   let auditRecord: ReturnType<typeof vi.fn>;
   let creditSellerEarning: ReturnType<typeof vi.fn>;
+  let recordDriverDebt: ReturnType<typeof vi.fn>;
   let sendToUsers: ReturnType<typeof vi.fn>;
   let publish: ReturnType<typeof vi.fn>;
   let immediateExclude: ReturnType<typeof vi.fn>;
@@ -59,6 +60,7 @@ describe('OrdersService — driver disappeared after pickup', () => {
     refundsCreate = vi.fn().mockResolvedValue({ id: 're_1' });
     auditRecord = vi.fn().mockResolvedValue(undefined);
     creditSellerEarning = vi.fn().mockResolvedValue(undefined);
+    recordDriverDebt = vi.fn().mockResolvedValue(undefined);
     sendToUsers = vi.fn().mockResolvedValue(undefined);
     publish = vi.fn().mockResolvedValue(undefined);
     immediateExclude = vi.fn().mockResolvedValue(undefined);
@@ -91,9 +93,10 @@ describe('OrdersService — driver disappeared after pickup', () => {
       { record: auditRecord } as never,
       {} as never,
       { sendToUsers } as never,
-      { creditSellerEarning } as never,
+      { creditSellerEarning, recordDriverDebt } as never,
       {} as never,
       { immediateExclude } as never,
+      { enqueue: async () => {} } as never,
     );
     vi.spyOn(service, 'publishOrderStatusChanged').mockImplementation(publish);
     logSpy = vi.spyOn(Logger.prototype, 'log');
@@ -169,6 +172,26 @@ describe('OrdersService — driver disappeared after pickup', () => {
     });
     // No driver delivery-earning is credited (only the seller is paid).
     expect(creditSellerEarning).toHaveBeenCalledTimes(1);
+  });
+
+  it('deducts the buyer refund from the driver wallet as debt (clawback)', async () => {
+    deliveryFindUnique.mockResolvedValue(delivery());
+
+    await service.handleDriverDeliveryTimeout('d1');
+
+    // Debt equals the refunded amount (buyer total). recordDriverDebt stores it
+    // as a negative AVAILABLE entry internally.
+    expect(recordDriverDebt).toHaveBeenCalledWith('o1', 'driver-1', 1500);
+    // No driver earning is ever credited.
+    expect(creditSellerEarning).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not create driver debt on an already-resolved (idempotent) run', async () => {
+    deliveryFindUnique.mockResolvedValue(delivery({ status: 'FAILED' }));
+
+    await service.handleDriverDeliveryTimeout('d1');
+
+    expect(recordDriverDebt).not.toHaveBeenCalled();
   });
 
   it('immediately excludes the driver (strike hook)', async () => {

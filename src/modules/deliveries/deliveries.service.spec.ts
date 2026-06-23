@@ -24,6 +24,7 @@ describe('DeliveriesService — confirm pickup + delivery (QR)', () => {
   let sendToUsers: ReturnType<typeof vi.fn>;
   let confirmDelivered: ReturnType<typeof vi.fn>;
   let cancelForSellerUnavailable: ReturnType<typeof vi.fn>;
+  let publishDeliveryCancelledToDriver: ReturnType<typeof vi.fn>;
   let directDeliveryUpdate: ReturnType<typeof vi.fn>;
   let service: DeliveriesService;
 
@@ -71,6 +72,7 @@ describe('DeliveriesService — confirm pickup + delivery (QR)', () => {
       .fn()
       .mockResolvedValue({ status: 'READY', buyerId: 'buyer-1', sellerId: 'seller-1' });
     cancelForSellerUnavailable = vi.fn().mockResolvedValue(undefined);
+    publishDeliveryCancelledToDriver = vi.fn().mockResolvedValue(undefined);
 
     const prisma = {
       $transaction: transaction,
@@ -88,6 +90,7 @@ describe('DeliveriesService — confirm pickup + delivery (QR)', () => {
         confirmDeliveredByDriver: confirmDelivered,
         cancelForSellerUnavailable,
         scheduleDriverDeliveryTimeout: vi.fn(),
+        publishDeliveryCancelledToDriver,
       } as never,
       {} as never,
       {} as never,
@@ -309,6 +312,11 @@ describe('DeliveriesService — confirm pickup + delivery (QR)', () => {
     expect(cancelForSellerUnavailable).toHaveBeenCalledWith('o1', 'driver-1');
     // Driver acknowledgement push.
     expect(sendToUsers).toHaveBeenCalledWith(['driver-1'], expect.objectContaining({}));
+    // Realtime cancel event to the assigned driver (auto-clear active job).
+    expect(publishDeliveryCancelledToDriver).toHaveBeenCalledWith(
+      'driver-1',
+      expect.objectContaining({ deliveryId: 'd1', orderId: 'o1', status: 'CANCELLED' }),
+    );
   });
 
   it('rejects a seller-unavailable report from a driver not assigned', async () => {

@@ -3,6 +3,7 @@ import {
   ConflictException,
   ForbiddenException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
@@ -17,6 +18,8 @@ import { generateUlid } from '@common/utils/code-generator.util';
 
 import { PrismaService } from '@infrastructure/database/prisma.service';
 
+import { StrikesService } from '@modules/strikes/strikes.service';
+
 import { CreateReviewCriterionDto } from './dto/create-review-criterion.dto';
 import { CreateReviewDto } from './dto/create-review.dto';
 import { CriterionRatingAggregate, SellerStatsResponseDto } from './dto/seller-stats-response.dto';
@@ -30,9 +33,21 @@ type ReviewWithRelations = Review & {
 
 type Tx = Prisma.TransactionClient;
 
+/**
+ * Rating-based seller suspension: a seller with at least RATING_MIN_REVIEWS
+ * whose average drops below RATING_SUSPENSION_THRESHOLD is suspended.
+ */
+const RATING_SUSPENSION_THRESHOLD = 3.5;
+const RATING_MIN_REVIEWS = 10;
+
 @Injectable()
 export class ReviewsService {
-  constructor(private readonly prisma: PrismaService) {}
+  private readonly logger = new Logger(ReviewsService.name);
+
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly strikes: StrikesService,
+  ) {}
 
   /**
    * Buyer creates a review for a delivered order. Atomic with:
@@ -114,12 +129,61 @@ export class ReviewsService {
       await this.recomputeSellerAggregates(tx, sellerId);
     });
 
+    // After the aggregates are committed, re-check the rating-suspension rule.
+    // Best-effort — a suspension-eval failure must not fail the review.
+    try {
+      await this.evaluateSellerRatingSuspension(sellerId);
+    } catch (err) {
+      this.logger.error(
+        `[SellerRating] evaluation failed sellerId=${sellerId}: ${(err as Error).message}`,
+      );
+    }
+
     const review = await this.prisma.db.review.findUnique({
       where: { id: reviewId },
       include: { author: true, criteriaRatings: true },
     });
     // Just inserted in the same logical operation — guaranteed to exist.
     return review!;
+  }
+
+  /**
+   * Suspends the seller when their average rating drops below
+   * RATING_SUSPENSION_THRESHOLD over at least RATING_MIN_REVIEWS reviews.
+   * Idempotent: a seller already suspended is left untouched (no duplicate
+   * action or notification). Existing `User.isSuspended` protections then hide
+   * them from the buyer feed and block new orders.
+   */
+  async evaluateSellerRatingSuspension(sellerId: string): Promise<void> {
+    const agg = await this.prisma.db.review.aggregate({
+      where: { sellerId },
+      _avg: { rating: true },
+      _count: { _all: true },
+    });
+    const count = agg._count._all;
+    const average = agg._avg.rating !== null ? Number(agg._avg.rating) : null;
+
+    if (count < RATING_MIN_REVIEWS || average === null || average >= RATING_SUSPENSION_THRESHOLD) {
+      return;
+    }
+
+    const user = await this.prisma.db.user.findUnique({
+      where: { id: sellerId },
+      select: { isSuspended: true },
+    });
+    if (!user || user.isSuspended) return; // idempotent — already suspended
+
+    await this.strikes.suspendUser(
+      sellerId,
+      'SELLER',
+      'Note vendeur inférieure à 3,5/5 avec au moins 10 avis',
+      {
+        message: 'Votre compte vendeur est suspendu car votre note moyenne est inférieure à 3,5/5.',
+      },
+    );
+    this.logger.log(
+      `[SellerRating] suspended sellerId=${sellerId} average=${average} count=${count}`,
+    );
   }
 
   /**
