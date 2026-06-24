@@ -320,6 +320,88 @@ export class AuthService {
   }
 
   /**
+   * PUBLIC fallback for a social login (Facebook) whose provider returned no
+   * email AND for which no Supabase session was created (the OAuth callback
+   * hard-errored). Because there is no session, the JWT-guarded
+   * `requestEmailOtp` can't be used — this no-session variant sends a 6-digit
+   * email OTP via Supabase, creating the email auth user if needed. Supabase
+   * owns the code generation, SMTP delivery, expiry and per-email rate limit;
+   * the controller adds an extra request throttle. The email is NOT trusted as
+   * verified until [verifySocialEmailOtp] confirms the code. Rejects an email
+   * already owned by an existing IncaCook account (no silent account linking).
+   * Never logs the address or code.
+   */
+  async requestSocialEmailOtp(provider: string, email: string): Promise<void> {
+    this.assertSupportedSocialProvider(provider);
+    await this.assertEmailNotTaken(email);
+    this.logger.log('[Auth][Facebook] verification code requested');
+    const { error } = await this.anon.client.auth.signInWithOtp({
+      email,
+      options: { shouldCreateUser: true },
+    });
+    if (error) {
+      throw this.toHttpException(error, 'social email OTP request failed');
+    }
+  }
+
+  /**
+   * PUBLIC: confirms the OTP sent by [requestSocialEmailOtp] and returns a
+   * fresh session for the now email-verified user. A wrong/expired/reused code
+   * fails with a clean French 401. Never logs the code or tokens.
+   */
+  async verifySocialEmailOtp(
+    provider: string,
+    email: string,
+    code: string,
+  ): Promise<SessionResponseDto> {
+    this.assertSupportedSocialProvider(provider);
+    const { data, error } = await this.anon.client.auth.verifyOtp({
+      email,
+      token: code,
+      type: 'email',
+    });
+    if (error || !data.session) {
+      this.logger.warn('[Auth][Facebook] manual email verification failed');
+      throw new UnauthorizedException('Code invalide ou expiré.');
+    }
+    // Best-effort mirror onto our User row (it may not exist yet — created at
+    // POST /v1/users during onboarding; Supabase already set email_confirmed_at).
+    try {
+      await this.prisma.db.user.update({
+        where: { supabaseId: data.session.user.id },
+        data: { emailVerified: true },
+      });
+    } catch (err) {
+      const errCode = (err as { code?: string } | null)?.code;
+      if (errCode !== 'P2025') throw err;
+    }
+    this.logger.log('[Auth][Facebook] manual email verified');
+    return this.toSession(data.session);
+  }
+
+  /** Only Facebook needs the no-session email fallback today. */
+  private assertSupportedSocialProvider(provider: string): void {
+    if (provider !== 'facebook') {
+      throw new BadRequestException('Unsupported social provider');
+    }
+  }
+
+  /**
+   * Guards account safety: refuse the social email fallback when the address
+   * already belongs to an IncaCook account, so a Facebook attempt can never be
+   * silently merged into someone else's account (no automatic linking).
+   */
+  private async assertEmailNotTaken(email: string): Promise<void> {
+    const owner = await this.prisma.db.user.findFirst({
+      where: { email },
+      select: { id: true },
+    });
+    if (owner) {
+      throw new ConflictException('Cette adresse e-mail est déjà utilisée par un autre compte.');
+    }
+  }
+
+  /**
    * Sends a phone OTP via Prelude Verify (server-side; the key never leaves
    * the backend). We store NO code — Prelude owns the OTP lifecycle. Rejects a
    * phone already attached to another user. [supabaseId] comes from the JWT.

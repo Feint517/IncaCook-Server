@@ -28,6 +28,8 @@ import { RequestPhoneOtpDto } from './dto/request-phone-otp.dto';
 import { SessionResponseDto } from './dto/session-response.dto';
 import { SignInDto } from './dto/sign-in.dto';
 import { SignUpDto } from './dto/sign-up.dto';
+import { SocialEmailRequestOtpDto } from './dto/social-email-request-otp.dto';
+import { SocialEmailVerifyOtpDto } from './dto/social-email-verify-otp.dto';
 import { UpdatePasswordDto } from './dto/update-password.dto';
 import { VerifyEmailOtpDto } from './dto/verify-email-otp.dto';
 import { VerifyPhoneOtpDto } from './dto/verify-phone-otp.dto';
@@ -168,6 +170,7 @@ export class AuthController {
    *     code binds to THIS account. Pair with POST /v1/auth/email/verify.
    */
   @Post('email/request-otp')
+  @Throttle({ default: { limit: 5, ttl: 60_000 } })
   @HttpCode(HttpStatus.NO_CONTENT)
   async requestEmailOtp(
     @CurrentUser() jwtUser: AuthenticatedUser,
@@ -226,6 +229,34 @@ export class AuthController {
     }
 
     return this.auth.verifyEmailOtp(jwtUser.id, email, dto.code);
+  }
+
+  /**
+   * PUBLIC no-session fallback for a social login (Facebook) that returned no
+   * email AND created no Supabase session. Sends a 6-digit email OTP (Supabase
+   * SMTP) so the user can attach + verify an email and continue. Rate-limited.
+   * Rejects an email already used by another account (409).
+   */
+  @Public()
+  @Post('social/email/request-otp')
+  @Throttle({ default: { limit: 5, ttl: 60_000 } })
+  @HttpCode(HttpStatus.NO_CONTENT)
+  async requestSocialEmailOtp(@Body() dto: SocialEmailRequestOtpDto): Promise<void> {
+    await this.auth.requestSocialEmailOtp(dto.provider, dto.email);
+  }
+
+  /**
+   * PUBLIC: confirms the 6-digit code from {@link requestSocialEmailOtp} and
+   * returns a fresh session for the now email-verified user. The app persists
+   * the tokens and continues to the same destination as a normal social login
+   * (onboarding if no profile, home if complete). Rate-limited.
+   */
+  @Public()
+  @Post('social/email/verify-otp')
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  @HttpCode(HttpStatus.OK)
+  verifySocialEmailOtp(@Body() dto: SocialEmailVerifyOtpDto): Promise<SessionResponseDto> {
+    return this.auth.verifySocialEmailOtp(dto.provider, dto.email, dto.code);
   }
 
   /**
