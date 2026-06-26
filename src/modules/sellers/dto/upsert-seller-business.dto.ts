@@ -36,9 +36,15 @@ export class UpsertSellerBusinessDto {
   @MaxLength(200)
   businessName!: string;
 
-  /** 14 digits, Luhn-validated at the service layer. */
+  /**
+   * 14 digits, Luhn-validated at the service layer. OPTIONAL at the DTO level:
+   * required only for Sauve Ton Panier (RESTAURANT), optional for Traiteur
+   * (enforced by category in the service). Omit / send null when empty — an
+   * empty string is rejected by the format check.
+   */
+  @IsOptional()
   @Matches(/^\d{14}$/, { message: 'siret must be exactly 14 digits' })
-  siret!: string;
+  siret?: string;
 
   /** Storage object key in `seller-facades/` (Phase D signed URL flow). */
   @IsOptional()

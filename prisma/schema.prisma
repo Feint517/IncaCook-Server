@@ -551,8 +551,10 @@ model SellerBusiness {
   seller SellerProfile @relation(fields: [userId], references: [userId], onDelete: Cascade)
 
   businessName String
-  // 14-digit, Luhn-validated. Unique across the platform.
-  siret        String  @unique
+  // 14-digit, Luhn-validated. Unique across the platform. Nullable: optional
+  // for Traiteur, required only for Sauve Ton Panier (RESTAURANT). Postgres
+  // treats NULLs as distinct, so multiple SIRET-less sellers don't collide.
+  siret        String? @unique
   // Storage key in `seller-facades/`. Resolved to a signed URL at read time.
   facadeUrl    String?
   legalForm    String?

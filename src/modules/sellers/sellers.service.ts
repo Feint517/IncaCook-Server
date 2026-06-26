@@ -274,7 +274,14 @@ export class SellersService {
       throw new BadRequestException('Fait-maison sellers do not have a business profile');
     }
 
-    if (!isValidSiret(dto.siret)) {
+    // SIRET rule by category: only Sauve Ton Panier (RESTAURANT) must provide
+    // one; Traiteur is optional (client decision). Fait-maison never reaches
+    // here. When provided, it must still pass Luhn. Stored null when absent.
+    const siret = dto.siret?.trim() ? dto.siret.trim() : null;
+    if (profile?.category === SellerCategory.RESTAURANT && !siret) {
+      throw new BadRequestException('Veuillez renseigner votre SIRET pour continuer.');
+    }
+    if (siret && !isValidSiret(siret)) {
       throw new BadRequestException('siret must pass Luhn validation');
     }
 
@@ -285,13 +292,13 @@ export class SellersService {
         create: {
           userId,
           businessName: dto.businessName,
-          siret: dto.siret,
+          siret,
           facadeUrl: dto.facadeUrl ?? null,
           legalForm: dto.legalForm ?? null,
         },
         update: {
           businessName: dto.businessName,
-          siret: dto.siret,
+          siret,
           facadeUrl: dto.facadeUrl ?? null,
           legalForm: dto.legalForm ?? null,
         },

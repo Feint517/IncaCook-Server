@@ -34,7 +34,7 @@ export class AdminKycDocumentResponseDto {
   static from(
     doc: KycDocument & {
       user: User & {
-        sellerProfile: { business: { siret: string; businessName: string } | null } | null;
+        sellerProfile: { business: { siret: string | null; businessName: string } | null } | null;
       };
     },
     signedFileUrl: string,
